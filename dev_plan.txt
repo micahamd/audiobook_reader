@@ -1,0 +1,111 @@
+a suggested directory and file structure for the Audiobook Reader application, based on the development plan (audiobook_reader_plan_v1).
+
+audiobook_reader/
+│
+├── main.py             # Application entry point: Initializes and runs the Qt application.
+│
+├── config.json         # (Optional) For storing persistent settings (TTS voice, speed, last file, etc.)
+│
+├── requirements.txt    # Lists Python package dependencies.
+│
+├── resources/          # Static assets like icons.
+│   └── icons/
+│       ├── play.png
+│       └── pause.png
+│       └── ... (other icons)
+│
+├── core/               # Core application logic, independent of the UI.
+│   ├── __init__.py
+│   ├── audio_processor.py # Handles audio loading, potentially basic processing.
+│   ├── text_processor.py  # Handles text loading, Markdown conversion (using markitdown), maybe text cleaning.
+│   ├── stt_engine.py      # Interface for the Speech-to-Text model (Whisper). Handles model loading & transcription.
+│   ├── tts_engine.py      # Interface for the Text-to-Speech model (Kokoro). Handles model loading, synthesis, and crucially, TIMING EXTRACTION.
+│   └── state_manager.py   # Manages loading/saving application state (using config.json or SQLite).
+│
+├── ui/                 # User Interface components (PyQt/PySide).
+│   ├── __init__.py
+│   ├── main_window.py     # Defines the main application window class (QMainWindow). Connects signals/slots.
+│   ├── widgets/           # Custom UI widgets if needed (e.g., a specialized text display).
+│   │   └── __init__.py
+│   └── dialogs/           # Custom dialog boxes (e.g., transcription prompt, settings).
+│       └── __init__.py
+│       └── transcription_dialog.py
+│       └── settings_dialog.py
+│
+├── utils/              # Utility functions or classes used across modules.
+│   ├── __init__.py
+│   └── helpers.py         # General helper functions (e.g., file path validation).
+│   └── threads.py         # Base classes or helpers for QThread background tasks.
+│
+├── models/             # Directory to potentially store downloaded ML models (Whisper, Kokoro).
+│   └── whisper/
+│   └── kokoro/
+│       └── (Model files would go here - structure depends on the library used)
+│
+├── temp/               # For temporary files (e.g., synthesized TTS audio). Should be gitignored.
+│   └── .gitkeep
+│
+└── tests/              # Unit and integration tests.
+    ├── __init__.py
+    ├── test_text_processor.py
+    └── test_tts_engine.py
+    └── ... (other test files)
+
+
+Explanation of Key Components:
+
+main.py: Sets up the Qt application instance, creates the MainWindow from ui/main_window.py, and starts the event loop.
+
+config.json / core/state_manager.py: Handles saving and loading user preferences and application state (Phase 5).
+
+resources/: Stores static files like icons needed for the UI.
+
+core/: Contains the non-UI logic. This separation makes the code more modular and testable.
+
+audio_processor.py, text_processor.py: Handle file input and conversion logic (Phase 2).
+
+stt_engine.py, tts_engine.py: Abstract the interactions with the ML models. The tts_engine.py is critical for Phase 3, especially getting timing data.
+
+ui/: All PyQt/PySide related code.
+
+main_window.py: The central hub for the UI, connecting buttons to actions in the core modules, displaying text, and managing the playback state (Phases 1, 3, 4).
+
+widgets/, dialogs/: For reusable UI parts.
+
+utils/: Shared helper functions or classes, like wrappers for running tasks in background threads (QThread) to keep the UI responsive (Used in Phases 2 & 3).
+
+models/: A designated place if you choose to download/store the ML models locally alongside the application code. How models are loaded/managed depends heavily on the chosen libraries (transformers, openai-whisper, etc.).
+
+temp/: For runtime-generated files like the WAV output from TTS. Ensure this isn't tracked by version control.
+
+tests/: Essential for ensuring components work correctly, especially the core processing and engine interactions.
+
+Development Workflow & Checkpoints:
+
+Setup (Phase 1): Create this structure. Set up the virtual environment, install dependencies (requirements.txt), and get a basic, empty window showing using main.py and ui/main_window.py.
+
+Checkpoint: Can you run python main.py and see an empty application window?
+
+Input & Conversion (Phase 2): Implement file dialogs in ui/main_window.py. Wire them up to call functions in core/audio_processor.py and core/text_processor.py (using utils/threads.py for background processing). Implement the markitdown and basic Whisper logic (without full model loading yet if preferred, just the structure). Display some text output in the UI.
+
+Checkpoint: Can you import a file/audio, trigger the processing (even if simulated), and see placeholder text appear in the main text area?
+
+TTS & Playback Setup (Phase 3 - Part 1): Focus on integrating the Kokoro TTS engine in core/tts_engine.py. Can you synthesize speech from a simple hardcoded string? Crucially, investigate and confirm you can extract word timings. Set up QMediaPlayer in ui/main_window.py and the basic Play/Pause logic, playing back a test audio file initially.
+
+Checkpoint: Can you synthesize speech from text? Can you play/pause a dummy audio file using the UI buttons? Have you confirmed a method for getting TTS timings?
+
+Full TTS & Playback (Phase 3 - Part 2): Connect the text display content to the TTS engine. Implement the flow: get text -> synthesize (in thread) -> get audio + timings -> load into QMediaPlayer -> play.
+
+Checkpoint: Can you load text (from Phase 2), press Play, hear the synthesized speech, and pause/resume it?
+
+Highlighting & Interactivity (Phase 4): Implement the QTimer logic in ui/main_window.py. Use the timings obtained in Phase 3 to highlight text in the QTextEdit. Implement the setReadOnly logic based on playback state. Handle text edits during pause (triggering re-synthesis).
+
+Checkpoint: Does the text highlight correctly as speech plays? Is the text box editable only when paused? Does editing text correctly trigger re-synthesis on the next play?
+
+State Persistence (Phase 5): Implement core/state_manager.py and integrate it into main.py (on load) and ui/main_window.py (on close/change).
+
+Checkpoint: Does the application remember the last file, TTS settings, and playback position when closed and reopened?
+
+Refinement (Phase 6): Add error handling, polish the UI, optimize performance, write tests.
+
+Checkpoint: Is the application robust? Does it handle errors gracefully? Is the performance acceptable?
