@@ -28,6 +28,9 @@ except ImportError as e:
 class KokoroOnnxEngine:
     """Interface for the Kokoro ONNX TTS engine."""
 
+    # Constants
+    SAMPLE_RATE = 24000  # Kokoro's sample rate
+
     def __init__(self, model_path: Optional[str] = None, voices_path: Optional[str] = None, temp_dir: Optional[str] = None):
         """
         Initialize the TTS engine.
@@ -595,6 +598,134 @@ class KokoroOnnxEngine:
             except Exception as e:
                 warnings.warn(f"Error playing chunk: {str(e)}")
                 time.sleep(0.1)
+
+    def find_chunk_for_position(self, position: float) -> int:
+        """
+        Find the chunk index containing the given position.
+
+        Args:
+            position: Position in seconds.
+
+        Returns:
+            Chunk index or -1 if not found.
+        """
+        # Check if we have word timings
+        if not self.word_timings:
+            return -1
+
+        # Find the word at the given position
+        word_index = -1
+        for i, timing in enumerate(self.word_timings):
+            if timing["start"] <= position <= timing["end"]:
+                word_index = i
+                break
+
+        if word_index == -1:
+            # If not found, find the closest word before the position
+            for i, timing in enumerate(self.word_timings):
+                if timing["start"] > position:
+                    if i > 0:
+                        word_index = i - 1
+                    break
+
+        if word_index == -1:
+            return -1
+
+        # Calculate which chunk this word belongs to
+        chunk_index = word_index // self.chunk_size
+        return chunk_index
+
+    def rewind_to_chunk(self, chunk_index: int) -> bool:
+        """
+        Rewind playback to the specified chunk.
+
+        Args:
+            chunk_index: The chunk index to rewind to.
+
+        Returns:
+            True if successful, False otherwise.
+        """
+        # Stop current playback
+        self.pause_requested = True
+
+        # Wait a bit for playback to stop
+        time.sleep(0.2)
+
+        # Clear the queue
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        # Find the chunk file
+        chunk_files = [f for f in self.chunk_files if f.endswith('.wav')]
+        if not chunk_files or chunk_index >= len(chunk_files):
+            return False
+
+        # Add the chunks from the specified index to the queue
+        for i, chunk_file in enumerate(chunk_files[chunk_index:]):
+            # Get the word timings for this chunk
+            chunk_word_timings = []
+            chunk_start = chunk_index * self.chunk_size
+            chunk_end = min(chunk_start + self.chunk_size, len(self.word_timings))
+
+            if chunk_start < len(self.word_timings):
+                chunk_word_timings = self.word_timings[chunk_start:chunk_end]
+
+            # Add to the queue
+            self.audio_queue.put((chunk_index + i, len(chunk_files), chunk_file, chunk_word_timings))
+
+        # Resume playback
+        self.pause_requested = False
+        return True
+
+    def clear_all_cache(self):
+        """
+        Clear all cached audio files and reset state.
+        This removes all files in the chunks directory and resets the engine state.
+        """
+        # Stop any ongoing processes
+        self.stop_requested = True
+        self.pause_requested = False
+        self.synthesis_complete = False
+        self.current_position = 0.0
+
+        # Clear the queue
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        # Clear the chunk files list
+        self.chunk_files = []
+
+        # Remove all files in the chunks directory
+        try:
+            for file in os.listdir(self.chunks_dir):
+                if file.endswith('.wav'):
+                    file_path = os.path.join(self.chunks_dir, file)
+                    try:
+                        os.remove(file_path)
+                        print(f"Removed cached file: {file_path}")
+                    except Exception as e:
+                        warnings.warn(f"Failed to remove file {file_path}: {str(e)}")
+        except Exception as e:
+            warnings.warn(f"Error clearing cache: {str(e)}")
+
+        # Also clear the temp directory
+        try:
+            for file in os.listdir(self.temp_dir):
+                if file.endswith('.wav') and os.path.isfile(os.path.join(self.temp_dir, file)):
+                    file_path = os.path.join(self.temp_dir, file)
+                    try:
+                        os.remove(file_path)
+                        print(f"Removed temp file: {file_path}")
+                    except Exception as e:
+                        warnings.warn(f"Failed to remove file {file_path}: {str(e)}")
+        except Exception as e:
+            warnings.warn(f"Error clearing temp directory: {str(e)}")
 
     def unload_model(self):
         """Unload the model to free memory."""

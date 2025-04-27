@@ -168,6 +168,12 @@ class MainWindow(QMainWindow):
         self.goto_bookmark_action.triggered.connect(self.goto_bookmark)
         toolbar.addAction(self.goto_bookmark_action)
 
+        # Add clear cache action
+        self.clear_cache_action = QAction("Clear Cache", self)
+        self.clear_cache_action.setToolTip("Clear all cached audio files and reset playback")
+        self.clear_cache_action.triggered.connect(self.clear_cache)
+        toolbar.addAction(self.clear_cache_action)
+
         settings_action = QAction(settings_icon, "Settings", self)
         settings_action.setToolTip("Configure voice, speed, and other settings")
         settings_action.triggered.connect(self.show_settings)
@@ -639,10 +645,19 @@ class MainWindow(QMainWindow):
             # For media player playback, convert from milliseconds to seconds
             current_time = self.media_player.position() / 1000
 
+        # Debug output
+        print(f"Current time: {current_time:.2f}s, Word timings count: {len(self.word_timings)}")
+
         # Get the current word from the TTS engine
-        current_word = self.tts_engine.get_word_at_position(current_time)
+        current_word = None
+        for timing in self.word_timings:
+            if timing["start"] <= current_time <= timing["end"]:
+                current_word = timing
+                break
 
         if current_word:
+            print(f"Highlighting word: '{current_word['word']}' at time {current_time:.2f}s")
+
             # Clear previous highlighting
             cursor = self.text_display.textCursor()
             cursor.select(QTextCursor.SelectionType.Document)
@@ -657,28 +672,51 @@ class MainWindow(QMainWindow):
 
             # Create a format for highlighting
             highlight_format = QTextCharFormat()
-            highlight_format.setBackground(QColor(255, 255, 0, 100))  # Light yellow
+            highlight_format.setBackground(QColor(255, 255, 0, 200))  # Brighter yellow
             highlight_format.setForeground(QColor(0, 0, 0))  # Black text
 
             # Find and highlight the word
             found = False
-            while not found:
-                found = cursor.movePosition(
+            word_count = 0
+            max_words = 1000  # Limit to prevent infinite loop
+
+            while not found and word_count < max_words:
+                word_count += 1
+
+                # Try to select the next word
+                if not cursor.movePosition(
                     QTextCursor.MoveOperation.NextWord,
                     QTextCursor.MoveMode.KeepAnchor
-                )
-                if not found:
+                ):
                     break
 
                 selected_text = cursor.selectedText().strip()
-                if selected_text.lower() == word.lower():
+
+                # Check if we found the word (case insensitive and ignoring punctuation)
+                if selected_text.lower().rstrip('.,;:!?') == word.lower().rstrip('.,;:!?'):
+                    # Apply highlighting
                     cursor.setCharFormat(highlight_format)
+
+                    # Save the cursor position for scrolling
+                    highlight_cursor = QTextCursor(cursor)
+
                     # Ensure the highlighted word is visible
+                    self.text_display.setTextCursor(highlight_cursor)
                     self.text_display.ensureCursorVisible()
+
+                    # Restore the user's cursor position if they were editing
+                    if not self.is_playing:
+                        user_cursor = self.text_display.textCursor()
+                        self.text_display.setTextCursor(user_cursor)
+
+                    found = True
                     break
 
                 # Reset selection and move to next word
                 cursor.clearSelection()
+
+            if not found:
+                print(f"Warning: Could not find word '{word}' in text to highlight")
 
     def on_text_changed(self):
         """Handle text changes in the text display."""
@@ -733,39 +771,123 @@ class MainWindow(QMainWindow):
             self.highlight_timer.stop()
             self.is_playing = False
             self.status_bar.showMessage("Paused. Text is now editable.")
+
+            # Store the cursor position for potential rewind
+            self.last_cursor_position = self.text_display.textCursor().position()
         else:
-            # Check if text was edited and needs re-synthesis
+            # Get the current cursor position
+            current_cursor_position = self.text_display.textCursor().position()
+
+            # Check if the cursor was moved (rewind requested)
+            cursor_moved = hasattr(self, 'last_cursor_position') and current_cursor_position != self.last_cursor_position
+
+            # Check if text was edited
             if self.text_edited:
                 print("Text was edited, re-synthesizing")
                 self.text_edited = False
+
+                # Stop any existing playback
+                self.tts_engine.stop_requested = True
+                if hasattr(self, 'synthesis_thread') and self.synthesis_thread:
+                    self.synthesis_thread.join(0.5)
+
+                # Clear audio path to force complete re-synthesis
+                self.current_audio_path = None
+
+                # Start new synthesis
+                self.synthesize_speech()
+            elif cursor_moved:
+                print(f"Cursor moved from {self.last_cursor_position} to {current_cursor_position}, rewinding")
+
+                # Find the word at the cursor position
+                cursor = self.text_display.textCursor()
+                cursor.select(QTextCursor.SelectionType.WordUnderCursor)
+                word_at_cursor = cursor.selectedText()
+
+                if word_at_cursor:
+                    print(f"Word at cursor: '{word_at_cursor}'")
+
+                    # Find the position of this word in the text
+                    text_up_to_cursor = self.current_text[:current_cursor_position]
+                    word_index = len(text_up_to_cursor.split())
+
+                    # Find the corresponding time in the word timings
+                    if word_index < len(self.word_timings):
+                        target_time = self.word_timings[word_index]["start"]
+                        print(f"Rewinding to time: {target_time:.2f}s")
+
+                        # For progressive playback
+                        if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
+                            # Set the current position in the TTS engine
+                            self.tts_engine.current_position = target_time
+
+                            # Find the chunk containing this position
+                            chunk_index = self.tts_engine.find_chunk_for_position(target_time)
+                            if chunk_index >= 0:
+                                print(f"Rewinding to chunk {chunk_index}")
+                                self.tts_engine.rewind_to_chunk(chunk_index)
+
+                            # Resume playback
+                            self.tts_engine.pause_requested = False
+                            self.play_button.setIcon(self.pause_icon)
+                            self.text_display.setReadOnly(True)
+                            self.highlight_timer.start(100)
+                            self.is_playing = True
+                            self.status_bar.showMessage(f"Rewound to position {format_time(target_time)}")
+                        else:
+                            # For media player playback
+                            position_ms = int(target_time * 1000)
+                            self.media_player.setPosition(position_ms)
+                            self.media_player.play()
+                            self.play_button.setIcon(self.pause_icon)
+                            self.text_display.setReadOnly(True)
+                            self.highlight_timer.start(100)
+                            self.is_playing = True
+                            self.status_bar.showMessage(f"Rewound to position {format_time(target_time)}")
+                    else:
+                        print("Could not find word timing for rewind position")
+                        # Just start normal playback
+                        self._start_or_resume_playback()
+                else:
+                    # No word at cursor, just start normal playback
+                    self._start_or_resume_playback()
+            else:
+                # No rewind or edit, just start or resume playback
+                self._start_or_resume_playback()
+
+    def _start_or_resume_playback(self):
+        """Start or resume playback without rewind."""
+        print("Starting or resuming playback")
+        # If we're using progressive playback
+        if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
+            # Resume the paused playback
+            self.tts_engine.toggle_pause()
+            # Update UI
+            self.play_button.setIcon(self.pause_icon)
+            self.text_display.setReadOnly(True)
+            self.highlight_timer.start(100)
+            self.is_playing = True
+            self.status_bar.showMessage("Resuming playback...")
+        else:
+            # Start new synthesis if no current playback
+            if not self.current_audio_path:
                 self.synthesize_speech()
             else:
-                print("Starting playback")
-                # If we're using progressive playback
-                if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
-                    # Resume the paused playback
-                    self.tts_engine.toggle_pause()
+                # Use the media player for non-progressive playback
+                self.media_player.play()
+
+                # Check if playback actually started
+                if self.media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                    print(f"Playback failed to start. Media player state: {self.media_player.playbackState()}")
+                    print(f"Media player error: {self.media_player.error()}")
+                    self.status_bar.showMessage(f"Playback error: {self.media_player.errorString()}")
+                else:
                     # Update UI
                     self.play_button.setIcon(self.pause_icon)
                     self.text_display.setReadOnly(True)
                     self.highlight_timer.start(100)
                     self.is_playing = True
-                    self.status_bar.showMessage("Resuming playback...")
-                else:
-                    # Start new synthesis if no current playback
-                    if not self.current_audio_path:
-                        self.synthesize_speech()
-                    else:
-                        # Use the media player for non-progressive playback
-                        self.media_player.play()
-
-                        # Check if playback actually started
-                        if self.media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-                            print(f"Playback failed to start. Media player state: {self.media_player.playbackState()}")
-                            print(f"Media player error: {self.media_player.error()}")
-                            self.status_bar.showMessage(f"Playback error: {self.media_player.errorString()}")
-                        else:
-                            print("Playback started successfully")
+                    print("Playback started successfully")
 
     def add_bookmark(self):
         """Save the current position as a bookmark."""
@@ -832,6 +954,41 @@ class MainWindow(QMainWindow):
 
         # Update UI
         self.status_bar.showMessage(f"Jumped to bookmark at {format_time(bookmark.get('position', 0))}")
+
+    def clear_cache(self):
+        """Clear all cached audio files and reset playback state."""
+        # Confirm with the user
+        response = QMessageBox.question(
+            self,
+            "Clear Cache",
+            "This will stop playback and remove all cached audio files. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if response != QMessageBox.StandardButton.Yes:
+            return
+
+        # Stop any current playback
+        if self.is_playing:
+            self.media_player.stop()
+            self.is_playing = False
+            self.play_button.setIcon(self.play_icon)
+            self.text_display.setReadOnly(False)
+            self.highlight_timer.stop()
+
+        # Stop any TTS processes
+        self.tts_engine.stop_requested = True
+        if hasattr(self, 'synthesis_thread') and self.synthesis_thread:
+            self.synthesis_thread.join(0.5)
+
+        # Clear audio path
+        self.current_audio_path = None
+
+        # Clear the TTS engine's cache
+        self.tts_engine.clear_all_cache()
+
+        # Update UI
+        self.status_bar.showMessage("Cache cleared. All audio files removed.")
 
     def show_settings(self):
         """Show the settings dialog."""
