@@ -62,7 +62,7 @@ An application for playing audiobooks with text highlighting and editing capabil
 
 - PyQt6: UI framework
 - pydub: Audio processing
-- markitdown: Text file conversion
+- markitdown-core: Text file conversion
 - openai-whisper: Speech-to-text (optional)
 - kokoro-onnx: Text-to-speech
 - sounddevice: Audio playback
@@ -81,4 +81,4 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 - [Kokoro ONNX](https://github.com/thewh1teagle/kokoro-onnx) for text-to-speech
 - [OpenAI Whisper](https://github.com/openai/whisper) for speech recognition
-- [markitdown](https://github.com/markitdown/markitdown) for text file conversion
+- [markitdown-core](https://github.com/markitdown/markitdown) for text file conversion
