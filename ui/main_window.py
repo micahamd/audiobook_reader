@@ -830,19 +830,36 @@ class MainWindow(QMainWindow):
 
         if self.is_playing:
             print("Pausing playback")
-            # Toggle pause in the TTS engine for progressive playback
-            self.tts_engine.toggle_pause()
-            # Also pause the media player for non-progressive playback
-            self.media_player.pause()
-            # Update UI
-            self.play_button.setIcon(self.play_icon)
-            self.text_display.setReadOnly(False)
-            self.highlight_timer.stop()
-            self.is_playing = False
-            self.status_bar.showMessage("Paused. Text is now editable.")
+            try:
+                # Check if we're using progressive playback
+                using_progressive = hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive()
 
-            # Store the cursor position for potential rewind
-            self.last_cursor_position = self.text_display.textCursor().position()
+                if using_progressive:
+                    # Toggle pause in the TTS engine for progressive playback
+                    is_paused = self.tts_engine.toggle_pause()
+                    print(f"Progressive playback paused: {is_paused}")
+                else:
+                    # Pause the media player for non-progressive playback
+                    self.media_player.pause()
+                    print(f"Media player paused")
+
+                # Update UI
+                self.play_button.setIcon(self.play_icon)
+                self.text_display.setReadOnly(False)
+                self.highlight_timer.stop()
+                self.is_playing = False
+                self.status_bar.showMessage("Paused. Text is now editable.")
+
+                # Store the cursor position for potential rewind
+                self.last_cursor_position = self.text_display.textCursor().position()
+            except Exception as e:
+                print(f"Error pausing playback: {str(e)}")
+                self.status_bar.showMessage(f"Error pausing: {str(e)}")
+                # Try to recover
+                self.is_playing = False
+                self.play_button.setIcon(self.play_icon)
+                self.text_display.setReadOnly(False)
+                self.highlight_timer.stop()
         else:
             # Get the current cursor position
             current_cursor_position = self.text_display.textCursor().position()
@@ -927,36 +944,55 @@ class MainWindow(QMainWindow):
     def _start_or_resume_playback(self):
         """Start or resume playback without rewind."""
         print("Starting or resuming playback")
-        # If we're using progressive playback
-        if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
-            # Resume the paused playback
-            self.tts_engine.toggle_pause()
-            # Update UI
-            self.play_button.setIcon(self.pause_icon)
-            self.text_display.setReadOnly(True)
-            self.highlight_timer.start(250)  # Slower highlighting
-            self.is_playing = True
-            self.status_bar.showMessage("Resuming playback...")
-        else:
-            # Start new synthesis if no current playback
-            if not self.current_audio_path:
-                self.synthesize_speech()
-            else:
-                # Use the media player for non-progressive playback
-                self.media_player.play()
+        try:
+            # If we're using progressive playback
+            if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
+                print("Resuming progressive playback")
+                # Resume the paused playback
+                is_paused = self.tts_engine.toggle_pause()
+                print(f"After toggle, is_paused = {is_paused}")
 
-                # Check if playback actually started
-                if self.media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-                    print(f"Playback failed to start. Media player state: {self.media_player.playbackState()}")
-                    print(f"Media player error: {self.media_player.error()}")
-                    self.status_bar.showMessage(f"Playback error: {self.media_player.errorString()}")
+                # If toggle_pause returned True, it means it's now paused (which is not what we want)
+                if is_paused:
+                    print("Toggle resulted in paused state, toggling again")
+                    is_paused = self.tts_engine.toggle_pause()
+                    print(f"After second toggle, is_paused = {is_paused}")
+
+                # Update UI
+                self.play_button.setIcon(self.pause_icon)
+                self.text_display.setReadOnly(True)
+                self.highlight_timer.start(250)  # Slower highlighting
+                self.is_playing = True
+                self.status_bar.showMessage("Resuming playback...")
+            else:
+                # Start new synthesis if no current playback
+                if not self.current_audio_path:
+                    print("No audio path, starting new synthesis")
+                    self.synthesize_speech()
                 else:
-                    # Update UI
-                    self.play_button.setIcon(self.pause_icon)
-                    self.text_display.setReadOnly(True)
-                    self.highlight_timer.start(250)  # Slower highlighting
-                    self.is_playing = True
-                    print("Playback started successfully")
+                    print("Using media player for playback")
+                    # Use the media player for non-progressive playback
+                    self.media_player.play()
+
+                    # Check if playback actually started
+                    if self.media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                        print(f"Playback failed to start. Media player state: {self.media_player.playbackState()}")
+                        print(f"Media player error: {self.media_player.error()}")
+                        self.status_bar.showMessage(f"Playback error: {self.media_player.errorString()}")
+                    else:
+                        # Update UI
+                        self.play_button.setIcon(self.pause_icon)
+                        self.text_display.setReadOnly(True)
+                        self.highlight_timer.start(250)  # Slower highlighting
+                        self.is_playing = True
+                        print("Playback started successfully")
+        except Exception as e:
+            print(f"Error in _start_or_resume_playback: {str(e)}")
+            self.status_bar.showMessage(f"Error resuming playback: {str(e)}")
+            # Try to recover
+            if not self.is_playing:
+                # Try to start new synthesis
+                self.synthesize_speech()
 
     def add_bookmark(self):
         """Save the current position as a bookmark."""

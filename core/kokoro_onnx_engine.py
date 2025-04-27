@@ -338,7 +338,14 @@ class KokoroOnnxEngine:
 
     def toggle_pause(self):
         """Toggle pause state."""
+        print(f"Toggling pause state from {self.pause_requested} to {not self.pause_requested}")
         self.pause_requested = not self.pause_requested
+
+        # If we're unpausing, make sure we're not also stopped
+        if not self.pause_requested:
+            self.stop_requested = False
+
+        return self.pause_requested  # Return the new state
 
     def synthesize_and_play_progressively(self, text: str, voice: str = "af_sarah", speed: float = 1.0, callback=None):
         """
