@@ -15,12 +15,13 @@ Before running the tests, make sure you have:
 
    If you already have the Kokoro project, copy the model files:
    ```
-   python copy_kokoro_models.py
+   cp /path/to/kokoro-v0_19.onnx models/kokoro/
+   cp /path/to/voices.json models/kokoro/
    ```
 
    Or download them automatically:
    ```
-   python download_models.py
+   python download_kokoro_models.py
    ```
 
    Or manually download:
@@ -47,7 +48,7 @@ The application includes fallback functionality when Kokoro model files are not 
 
 If you have the Kokoro model files in a different location, you can modify the code to use them:
 
-1. Open `core/kokoro_tts_engine.py`
+1. Open `core/kokoro_onnx_engine.py`
 2. Update the `__init__` method to use your model file paths:
    ```python
    self.model_path = "/path/to/kokoro-v0_19.onnx"

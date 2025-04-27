@@ -5,7 +5,7 @@ Main window module for the Audiobook Reader application.
 import os
 from typing import Dict, List, Optional, Tuple, Union
 
-from PyQt6.QtCore import QTimer, Qt, pyqtSlot, QSize
+from PyQt6.QtCore import QTimer, Qt, pyqtSlot, QSize, QUrl
 from PyQt6.QtGui import QAction, QFont, QTextCursor, QTextCharFormat, QColor, QIcon
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -17,7 +17,7 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QAudioFormat, QMediaD
 from core.audio_processor import AudioProcessor
 from core.text_processor import TextProcessor
 from core.stt_engine import STTEngine
-from core.kokoro_tts_engine import KokoroTTSEngine
+from core.kokoro_onnx_engine import KokoroOnnxEngine
 from core.state_manager import StateManager
 from ui.dialogs.transcription_dialog import TranscriptionDialog
 from ui.dialogs.settings_dialog import SettingsDialog
@@ -39,7 +39,7 @@ class MainWindow(QMainWindow):
         self.audio_processor = AudioProcessor()
         self.text_processor = TextProcessor()
         self.stt_engine = STTEngine()
-        self.tts_engine = KokoroTTSEngine()
+        self.tts_engine = KokoroOnnxEngine()
         self.state_manager = StateManager()
         self.thread_manager = ThreadManager()
 
@@ -81,7 +81,7 @@ class MainWindow(QMainWindow):
 
         # Create text display
         self.text_display = QTextEdit()
-        self.text_display.setReadOnly(True)
+        self.text_display.setReadOnly(True)  # Initially read-only, will be made editable when paused
         self.text_display.setFont(QFont("Arial", 12))
         self.text_display.textChanged.connect(self.on_text_changed)
         main_layout.addWidget(self.text_display)
@@ -248,7 +248,9 @@ class MainWindow(QMainWindow):
                 self.current_audio_path = file_path
                 self.current_text = ""
                 self.text_display.clear()
-                self.media_player.setSource(file_path)
+                # Convert the file path to a QUrl
+                file_url = QUrl.fromLocalFile(file_path)
+                self.media_player.setSource(file_url)
                 self.status_bar.showMessage(f"Loaded audio: {os.path.basename(file_path)}")
 
             self.progress_bar.setVisible(False)
@@ -321,6 +323,10 @@ class MainWindow(QMainWindow):
             self.current_text = content
             self.text_display.setPlainText(content)
 
+            # Make text editable immediately
+            self.text_display.setReadOnly(False)
+            self.status_bar.showMessage("Text is editable. Edit as needed, then press Play to synthesize.")
+
             # Synthesize speech
             self.synthesize_speech()
 
@@ -390,13 +396,35 @@ class MainWindow(QMainWindow):
         """
         audio_path, word_timings = result
 
+        print(f"Synthesis complete. Audio path: {audio_path}")
+        print(f"Word timings count: {len(word_timings)}")
+
+        # Check if the audio file exists
+        if not os.path.exists(audio_path):
+            print(f"Warning: Audio file does not exist at {audio_path}")
+            self.status_bar.showMessage("Error: Audio file not found")
+            return
+
         self.current_audio_path = audio_path
         self.word_timings = word_timings
 
         # Load the audio into the media player
-        self.media_player.setSource(audio_path)
+        print(f"Setting media source to: {audio_path}")
+        # Convert the file path to a QUrl
+        file_url = QUrl.fromLocalFile(audio_path)
+        print(f"File URL: {file_url.toString()}")
+        self.media_player.setSource(file_url)
 
-        self.status_bar.showMessage("Synthesis complete")
+        # Check if the source was set correctly
+        if self.media_player.source().isEmpty():
+            print("Warning: Media source is empty after setting")
+            self.status_bar.showMessage("Error: Could not load audio file")
+        else:
+            print(f"Media source set to: {self.media_player.source().toString()}")
+            # Make sure text is editable after synthesis
+            self.text_display.setReadOnly(False)
+            self.status_bar.showMessage("Synthesis complete. Text is editable. Press play to start.")
+
         self.progress_bar.setVisible(False)
 
     def handle_worker_error(self, error_info):
@@ -411,15 +439,7 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("")
         QMessageBox.critical(self, "Error", f"An error occurred: {str(exception)}")
 
-    def toggle_playback(self):
-        """Toggle playback between play and pause."""
-        if not self.current_audio_path:
-            return
-
-        if self.is_playing:
-            self.media_player.pause()
-        else:
-            self.media_player.play()
+    # This method is replaced by the one below that handles text edits
 
     def playback_state_changed(self, state):
         """
@@ -428,16 +448,24 @@ class MainWindow(QMainWindow):
         Args:
             state: The new playback state.
         """
+        print(f"Playback state changed to: {state}")
+
         if state == QMediaPlayer.PlaybackState.PlayingState:
             self.is_playing = True
             self.play_button.setIcon(self.pause_icon)
             self.text_display.setReadOnly(True)
             self.highlight_timer.start(100)  # Update highlight every 100ms
+            self.status_bar.showMessage("Playing audio...")
         else:
             self.is_playing = False
             self.play_button.setIcon(self.play_icon)
-            self.text_display.setReadOnly(False)
+            self.text_display.setReadOnly(False)  # Make text editable when paused
             self.highlight_timer.stop()
+
+            if state == QMediaPlayer.PlaybackState.PausedState:
+                self.status_bar.showMessage("Paused. Text is now editable.")
+            elif state == QMediaPlayer.PlaybackState.StoppedState:
+                self.status_bar.showMessage("Stopped. Text is now editable.")
 
     def position_changed(self, position):
         """
@@ -530,6 +558,7 @@ class MainWindow(QMainWindow):
         if not self.is_playing and self.current_text:
             # Mark that text has been edited
             self.text_edited = True
+            print("Text changed. Marked for re-synthesis.")
 
             # Start the timer to trigger re-synthesis after a delay
             self.edit_timer.start(2000)  # 2 seconds delay
@@ -539,26 +568,43 @@ class MainWindow(QMainWindow):
         if self.text_edited:
             # Get the updated text
             new_text = self.text_display.toPlainText()
+            print(f"Handling text edit. New text length: {len(new_text)}")
 
             # Only re-synthesize if the text has actually changed
             if new_text != self.current_text:
                 self.current_text = new_text
+                print("Text content changed. Will re-synthesize on play.")
                 self.status_bar.showMessage("Text edited. Will re-synthesize on play.")
 
     def toggle_playback(self):
         """Toggle playback between play and pause."""
+        print(f"Toggle playback called. Current audio path: {self.current_audio_path}")
+        print(f"Is playing: {self.is_playing}, Text edited: {self.text_edited}")
+
         if not self.current_audio_path:
+            self.status_bar.showMessage("No audio available. Please import a file first.")
             return
 
         if self.is_playing:
+            print("Pausing playback")
             self.media_player.pause()
         else:
             # Check if text was edited and needs re-synthesis
             if self.text_edited:
+                print("Text was edited, re-synthesizing")
                 self.text_edited = False
                 self.synthesize_speech()
             else:
+                print("Starting playback")
                 self.media_player.play()
+
+                # Check if playback actually started
+                if self.media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                    print(f"Playback failed to start. Media player state: {self.media_player.playbackState()}")
+                    print(f"Media player error: {self.media_player.error()}")
+                    self.status_bar.showMessage(f"Playback error: {self.media_player.errorString()}")
+                else:
+                    print("Playback started successfully")
 
     def show_settings(self):
         """Show the settings dialog."""

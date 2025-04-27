@@ -1,13 +1,12 @@
 """
 Text-to-Speech engine module for the Audiobook Reader application.
-Uses the Kokoro ONNX model for speech synthesis with timing information.
+Uses the Kokoro pipeline for speech synthesis with timing information.
 Implements streaming and windowed text processing for efficient handling of large texts.
 """
 
 import os
 import tempfile
 import re
-import time
 import warnings
 from typing import Dict, List, Optional, Tuple, Union, Generator, Any
 from collections import deque
@@ -15,13 +14,13 @@ from collections import deque
 import numpy as np
 import soundfile as sf
 
-# Try to import kokoro_onnx, but handle import errors gracefully
+# Try to import kokoro, but handle import errors gracefully
 try:
-    from kokoro_onnx import Kokoro
-    import sounddevice as sd
+    from kokoro import KPipeline
+    import torch
     KOKORO_AVAILABLE = True
 except ImportError as e:
-    warnings.warn(f"Failed to import kokoro_onnx: {str(e)}. TTS functionality will be limited.")
+    warnings.warn(f"Failed to import kokoro: {str(e)}. TTS functionality will be limited.")
     KOKORO_AVAILABLE = False
 
 
@@ -73,30 +72,26 @@ class TextChunk:
             timing["end"] += start_time
 
 
-class KokoroTTSEngine:
-    """Interface for the Kokoro ONNX TTS model with streaming support."""
+class KokoroPipelineEngine:
+    """Interface for the Kokoro TTS pipeline with streaming support."""
 
     CHUNK_SIZE = 100  # Number of words per chunk
     MAX_CACHE_CHUNKS = 10  # Maximum number of chunks to keep in cache
+    SAMPLE_RATE = 24000  # Kokoro's sample rate
 
-    def __init__(self, model_path: Optional[str] = None, voices_path: Optional[str] = None, temp_dir: Optional[str] = None):
+    def __init__(self, temp_dir: Optional[str] = None):
         """
         Initialize the TTS engine.
 
         Args:
-            model_path: Path to the Kokoro ONNX model file. If None, uses the default.
-            voices_path: Path to the voices.json file. If None, uses the default.
             temp_dir: Directory for temporary files. If None, uses the default.
         """
-        self.model_path = model_path or os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models', 'kokoro', 'kokoro-v0_19.onnx')
-        self.voices_path = voices_path or os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models', 'kokoro', 'voices.json')
         self.temp_dir = temp_dir or os.path.join(os.path.dirname(os.path.dirname(__file__)), 'temp')
 
         # Ensure directories exist
-        os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
         os.makedirs(self.temp_dir, exist_ok=True)
 
-        self.kokoro = None
+        self.pipeline = None
 
         # Cache for processed chunks
         self.chunk_cache = deque(maxlen=self.MAX_CACHE_CHUNKS)
@@ -107,27 +102,18 @@ class KokoroTTSEngine:
     def load_model(self):
         """Load the Kokoro model."""
         if not KOKORO_AVAILABLE:
-            raise ImportError("Cannot load model: kokoro_onnx is not available. "
-                             "Please install the required dependencies.")
+            warnings.warn("Kokoro is not available. Using fallback synthesis.")
+            self.pipeline = None
+            return
 
-        if self.kokoro is None:
-            # Check if model files exist
-            if not os.path.exists(self.model_path):
-                warnings.warn(f"Kokoro model file not found at {self.model_path}. "
-                             f"Using fallback synthesis.")
-                return
-
-            if not os.path.exists(self.voices_path):
-                warnings.warn(f"Voices file not found at {self.voices_path}. "
-                             f"Using fallback synthesis.")
-                return
-
+        if self.pipeline is None:
             try:
-                # Load the model
-                self.kokoro = Kokoro(self.model_path, self.voices_path)
+                # Initialize the Kokoro pipeline
+                self.pipeline = KPipeline(lang_code='a')  # 'a' for auto-detect
+                print("Kokoro pipeline initialized successfully")
             except Exception as e:
-                warnings.warn(f"Failed to load Kokoro model: {str(e)}. Using fallback synthesis.")
-                self.kokoro = None
+                warnings.warn(f"Failed to initialize Kokoro pipeline: {str(e)}. Using fallback synthesis.")
+                self.pipeline = None
 
     def split_text_into_chunks(self, text: str) -> List[TextChunk]:
         """
@@ -197,8 +183,19 @@ class KokoroTTSEngine:
             }
             return
 
-        if self.kokoro is None:
+        if self.pipeline is None:
             self.load_model()
+
+        # If pipeline still None after loading, use dummy synthesis
+        if self.pipeline is None:
+            audio_path, word_timings = self._dummy_synthesize(text, speed)
+            yield {
+                "chunk_id": 0,
+                "audio_path": audio_path,
+                "word_timings": word_timings,
+                "duration": len(word_timings) * 0.3 / speed if word_timings else 0
+            }
+            return
 
         # Split text into chunks
         chunks = self.split_text_into_chunks(text)
@@ -256,6 +253,14 @@ class KokoroTTSEngine:
         if not KOKORO_AVAILABLE:
             return self._dummy_synthesize(text, speed)
 
+        # Load the model if not loaded
+        if self.pipeline is None:
+            self.load_model()
+
+        # If pipeline still None after loading, use dummy synthesis
+        if self.pipeline is None:
+            return self._dummy_synthesize(text, speed)
+
         # Split text into chunks
         self.chunks = self.split_text_into_chunks(text)
 
@@ -307,7 +312,7 @@ class KokoroTTSEngine:
             Tuple of (audio_path, word_timings)
         """
         # Create a simple sine wave as dummy audio
-        sample_rate = 22050
+        sample_rate = self.SAMPLE_RATE
         duration = len(text.split()) * 0.3 / speed  # Rough estimate: 0.3 seconds per word
         t = np.linspace(0, duration, int(sample_rate * duration), False)
         audio = 0.5 * np.sin(2 * np.pi * 440 * t)  # 440 Hz sine wave
@@ -337,7 +342,7 @@ class KokoroTTSEngine:
 
         return temp_file.name, word_timings
 
-    def _synthesize_chunk(self, text: str, voice: str, speed: float) -> Tuple[str, List[Dict[str, Union[str, float]]], float]:
+    def _synthesize_chunk(self, text: str, voice: str = "af_sarah", speed: float = 1.0) -> Tuple[str, List[Dict[str, Union[str, float]]], float]:
         """
         Synthesize speech for a chunk of text.
 
@@ -349,34 +354,65 @@ class KokoroTTSEngine:
         Returns:
             Tuple of (audio_path, word_timings, duration)
         """
-        if not KOKORO_AVAILABLE or self.kokoro is None:
+        if not KOKORO_AVAILABLE or self.pipeline is None:
             # Create a dummy audio for this chunk
             return self._dummy_synthesize_chunk(text, speed)
 
         try:
-            # Generate speech using Kokoro
-            samples, sample_rate = self.kokoro.create(
-                text,
-                voice=voice,
-                speed=speed,
-                lang="en-us"
-            )
+            # Generate speech using Kokoro pipeline
+            print(f"Synthesizing chunk with voice: {voice}, speed: {speed}")
+
+            # Create a temporary file for the audio
+            temp_file = tempfile.NamedTemporaryFile(suffix='.wav', dir=self.temp_dir, delete=False)
+            temp_file.close()
+
+            # Process the text with Kokoro
+            all_audio = []
+            word_positions = []
+            word_count = 0
+
+            # Use the pipeline to generate audio
+            generator = self.pipeline(text, voice=voice)
+
+            for i, (gs, ps, audio) in enumerate(generator):
+                # Collect audio segments
+                all_audio.append(audio)
+
+                # Extract words from this segment
+                segment_text = text.split()[word_count:word_count + len(gs)]
+                word_count += len(gs)
+
+                # Store word positions
+                for word in segment_text:
+                    word_positions.append(word)
+
+            # Combine all audio segments
+            if all_audio:
+                combined_audio = np.concatenate(all_audio)
+
+                # Apply speed adjustment if needed
+                if speed != 1.0:
+                    # Simple resampling for speed adjustment
+                    indices = np.round(np.linspace(0, len(combined_audio) - 1, int(len(combined_audio) / speed))).astype(int)
+                    combined_audio = combined_audio[indices]
+
+                # Save the combined audio
+                sf.write(temp_file.name, combined_audio, self.SAMPLE_RATE)
+
+                # Calculate duration
+                duration = len(combined_audio) / self.SAMPLE_RATE
+
+                # Extract word timings
+                word_timings = self._extract_word_timings(word_positions, duration)
+
+                return temp_file.name, word_timings, duration
+            else:
+                # Fallback if no audio was generated
+                return self._dummy_synthesize_chunk(text, speed)
+
         except Exception as e:
             warnings.warn(f"Failed to synthesize speech: {str(e)}. Using fallback synthesis.")
             return self._dummy_synthesize_chunk(text, speed)
-
-        # Save to a temporary file
-        temp_file = tempfile.NamedTemporaryFile(suffix='.wav', dir=self.temp_dir, delete=False)
-        temp_file.close()
-        sf.write(temp_file.name, samples, sample_rate)
-
-        # Calculate duration
-        duration = len(samples) / sample_rate
-
-        # Extract word timings
-        word_timings = self._extract_word_timings(text, duration)
-
-        return temp_file.name, word_timings, duration
 
     def _dummy_synthesize_chunk(self, text: str, speed: float) -> Tuple[str, List[Dict[str, Union[str, float]]], float]:
         """
@@ -390,7 +426,7 @@ class KokoroTTSEngine:
             Tuple of (audio_path, word_timings, duration)
         """
         # Create a simple sine wave as dummy audio
-        sample_rate = 22050
+        sample_rate = self.SAMPLE_RATE
         duration = len(text.split()) * 0.3 / speed  # Rough estimate: 0.3 seconds per word
         t = np.linspace(0, duration, int(sample_rate * duration), False)
         audio = 0.5 * np.sin(2 * np.pi * 440 * t)  # 440 Hz sine wave
@@ -401,24 +437,21 @@ class KokoroTTSEngine:
         sf.write(temp_file.name, audio, sample_rate)
 
         # Extract word timings
-        word_timings = self._extract_word_timings(text, duration)
+        word_timings = self._extract_word_timings(text.split(), duration)
 
         return temp_file.name, word_timings, duration
 
-    def _extract_word_timings(self, text: str, duration: float) -> List[Dict[str, Union[str, float]]]:
+    def _extract_word_timings(self, words: List[str], duration: float) -> List[Dict[str, Union[str, float]]]:
         """
-        Extract word timings based on text and duration.
+        Extract word timings based on words and duration.
 
         Args:
-            text: The input text.
+            words: List of words.
             duration: The duration of the audio in seconds.
 
         Returns:
             List of dictionaries with word timing information.
         """
-        # Split text into words while preserving punctuation
-        words = re.findall(r'\S+', text)
-
         # Calculate average word duration
         word_duration = duration / len(words) if words else 0
 
@@ -619,4 +652,4 @@ class KokoroTTSEngine:
 
     def unload_model(self):
         """Unload the model to free memory."""
-        self.kokoro = None
+        self.pipeline = None

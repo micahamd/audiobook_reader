@@ -29,12 +29,13 @@ An application for playing audiobooks with text highlighting and editing capabil
 
    If you already have the Kokoro project, you can copy the model files:
    ```
-   python copy_kokoro_models.py
+   cp /path/to/kokoro-v0_19.onnx models/kokoro/
+   cp /path/to/voices.json models/kokoro/
    ```
 
    Or download them automatically:
    ```
-   python download_models.py
+   python download_kokoro_models.py
    ```
 
    Or manually:
@@ -66,7 +67,6 @@ An application for playing audiobooks with text highlighting and editing capabil
 - openai-whisper: Speech-to-text (optional)
 - kokoro-onnx: Text-to-speech
 - sounddevice: Audio playback
-- soundfile: Audio file handling
 - numpy: Numerical operations
 
 ## Testing

@@ -43,6 +43,7 @@ class SettingsDialog(QDialog):
 
         # Voice selection
         self.voice_combo = QComboBox()
+        self.voice_combo.addItem("Heart (Female)", "af_heart")
         self.voice_combo.addItem("Sarah (Female)", "af_sarah")
         self.voice_combo.addItem("Nicole (Female)", "af_nicole")
         self.voice_combo.addItem("Sky (Female)", "af_sky")
