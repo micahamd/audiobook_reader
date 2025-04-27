@@ -763,8 +763,7 @@ class MainWindow(QMainWindow):
                         self.text_display.setTextCursor(highlight_cursor)
 
                         # Scroll to make the highlighted word visible
-                        # Position it in the middle of the viewport
-                        self.text_display.centerCursor()
+                        self.text_display.ensureCursorVisible()
 
                     found = True
                     break
