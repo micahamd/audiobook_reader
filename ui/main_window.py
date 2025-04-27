@@ -7,7 +7,7 @@ import time
 from typing import Dict, List, Optional, Tuple, Union
 
 from PyQt6.QtCore import QTimer, Qt, pyqtSlot, QSize, QUrl
-from PyQt6.QtGui import QAction, QFont, QTextCursor, QTextCharFormat, QColor, QIcon
+from PyQt6.QtGui import QAction, QFont, QTextCursor, QTextCharFormat, QColor, QIcon, QTextDocument
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QPushButton, QToolBar, QFileDialog,
@@ -385,9 +385,25 @@ class MainWindow(QMainWindow):
         # Stop any existing playback
         if self.is_playing:
             self.media_player.stop()
+            self.is_playing = False
 
         # Stop any existing TTS processes
         self.tts_engine.stop_requested = True
+
+        # Wait for any existing threads to finish
+        if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
+            try:
+                self.synthesis_thread.join(1.0)  # Wait up to 1 second
+            except Exception as e:
+                print(f"Warning: Could not join synthesis thread: {str(e)}")
+
+        # Clear any existing audio path
+        self.current_audio_path = None
+
+        # Reset UI state
+        self.play_button.setIcon(self.pause_icon)
+        self.text_display.setReadOnly(True)
+        self.highlight_timer.stop()
 
         # Show progress
         self.progress_bar.setVisible(True)
@@ -405,6 +421,9 @@ class MainWindow(QMainWindow):
                 self.handle_first_chunk(audio_path, word_timings)
 
         try:
+            # Clear the cache first to avoid any conflicts
+            self.tts_engine.clear_all_cache()
+
             # Start progressive synthesis and playback
             self.synthesis_thread, self.playback_thread = self.tts_engine.synthesize_and_play_progressively(
                 self.current_text,
@@ -418,6 +437,10 @@ class MainWindow(QMainWindow):
             self.play_button.setIcon(self.pause_icon)
             self.text_display.setReadOnly(True)
             self.highlight_timer.start(100)  # Update highlight every 100ms
+
+            # Reset the last highlighted index
+            if hasattr(self, 'last_highlighted_index'):
+                delattr(self, 'last_highlighted_index')
 
         except Exception as e:
             # Handle errors
@@ -645,75 +668,118 @@ class MainWindow(QMainWindow):
             # For media player playback, convert from milliseconds to seconds
             current_time = self.media_player.position() / 1000
 
-        # Debug output
-        print(f"Current time: {current_time:.2f}s, Word timings count: {len(self.word_timings)}")
-
-        # Get the current word from the TTS engine
-        current_word = None
-        for timing in self.word_timings:
+        # Find the current word index based on time
+        current_word_index = -1
+        for i, timing in enumerate(self.word_timings):
             if timing["start"] <= current_time <= timing["end"]:
-                current_word = timing
+                current_word_index = i
                 break
 
-        if current_word:
-            print(f"Highlighting word: '{current_word['word']}' at time {current_time:.2f}s")
+        # If we didn't find an exact match, find the closest word
+        if current_word_index == -1:
+            # Find the word that's about to be spoken
+            for i, timing in enumerate(self.word_timings):
+                if timing["start"] > current_time:
+                    if i > 0:
+                        current_word_index = i - 1
+                    else:
+                        current_word_index = 0
+                    break
 
-            # Clear previous highlighting
-            cursor = self.text_display.textCursor()
-            cursor.select(QTextCursor.SelectionType.Document)
-            cursor.setCharFormat(QTextCharFormat())
+        # If we still don't have a word, use the last word
+        if current_word_index == -1 and self.word_timings:
+            current_word_index = len(self.word_timings) - 1
+
+        # If we have a valid word index, highlight it
+        if current_word_index >= 0 and current_word_index < len(self.word_timings):
+            current_word = self.word_timings[current_word_index]
+
+            # Store the current word index to avoid unnecessary updates
+            if hasattr(self, 'last_highlighted_index') and self.last_highlighted_index == current_word_index:
+                return  # Skip if we're already highlighting this word
+
+            self.last_highlighted_index = current_word_index
 
             # Get the word to highlight
             word = current_word["word"]
 
-            # Find the word in the text
-            cursor = self.text_display.textCursor()
-            cursor.setPosition(0)
+            # Save the current cursor position and scroll position
+            old_cursor = self.text_display.textCursor()
+            old_scroll_value = self.text_display.verticalScrollBar().value()
+
+            # Clear previous highlighting
+            clear_cursor = QTextCursor(self.text_display.document())
+            clear_cursor.select(QTextCursor.SelectionType.Document)
+            clear_cursor.setCharFormat(QTextCharFormat())
 
             # Create a format for highlighting
             highlight_format = QTextCharFormat()
             highlight_format.setBackground(QColor(255, 255, 0, 200))  # Brighter yellow
             highlight_format.setForeground(QColor(0, 0, 0))  # Black text
 
+            # Calculate approximate position in text
+            # This is more efficient than searching through the entire text
+            words_before = current_word_index
+            approx_char_pos = min(words_before * 6, self.text_display.document().characterCount() - 1)  # Estimate 6 chars per word
+
+            # Start searching from the approximate position
+            cursor = QTextCursor(self.text_display.document())
+            cursor.setPosition(max(0, approx_char_pos - 100))  # Start a bit before the estimated position
+
             # Find and highlight the word
             found = False
-            word_count = 0
-            max_words = 1000  # Limit to prevent infinite loop
+            search_count = 0
+            max_searches = 200  # Limit searches to avoid performance issues
 
-            while not found and word_count < max_words:
-                word_count += 1
+            while not found and search_count < max_searches:
+                search_count += 1
 
-                # Try to select the next word
-                if not cursor.movePosition(
-                    QTextCursor.MoveOperation.NextWord,
-                    QTextCursor.MoveMode.KeepAnchor
-                ):
-                    break
+                # Find the next occurrence of the word
+                search_result = self.text_display.document().find(
+                    word,
+                    cursor,
+                    QTextDocument.FindFlag.FindCaseSensitively
+                )
 
-                selected_text = cursor.selectedText().strip()
+                if search_result.isNull():
+                    # If not found with exact case, try case-insensitive
+                    cursor.setPosition(max(0, approx_char_pos - 100))
+                    search_result = self.text_display.document().find(
+                        word,
+                        cursor,
+                        QTextDocument.FindFlag.FindWholeWords
+                    )
 
-                # Check if we found the word (case insensitive and ignoring punctuation)
-                if selected_text.lower().rstrip('.,;:!?') == word.lower().rstrip('.,;:!?'):
+                if not search_result.isNull():
                     # Apply highlighting
-                    cursor.setCharFormat(highlight_format)
+                    search_result.setCharFormat(highlight_format)
 
-                    # Save the cursor position for scrolling
-                    highlight_cursor = QTextCursor(cursor)
+                    # Create a cursor at the highlighted position for scrolling
+                    highlight_cursor = QTextCursor(search_result)
 
-                    # Ensure the highlighted word is visible
-                    self.text_display.setTextCursor(highlight_cursor)
-                    self.text_display.ensureCursorVisible()
+                    # Only scroll if we're in playback mode
+                    if self.is_playing:
+                        # Set the cursor to ensure the highlighted word is visible
+                        self.text_display.setTextCursor(highlight_cursor)
 
-                    # Restore the user's cursor position if they were editing
-                    if not self.is_playing:
-                        user_cursor = self.text_display.textCursor()
-                        self.text_display.setTextCursor(user_cursor)
+                        # Scroll to make the highlighted word visible
+                        # Position it in the middle of the viewport
+                        self.text_display.centerCursor()
 
                     found = True
                     break
+                else:
+                    # If not found near the estimated position, try from the beginning
+                    if search_count == 1:
+                        cursor.setPosition(0)
+                    else:
+                        # Move forward and try again
+                        cursor.movePosition(QTextCursor.MoveOperation.NextWord)
 
-                # Reset selection and move to next word
-                cursor.clearSelection()
+            # If we're not in playback mode, restore the original cursor and scroll position
+            if not self.is_playing:
+                self.text_display.setTextCursor(old_cursor)
+                self.text_display.verticalScrollBar().setValue(old_scroll_value)
 
             if not found:
                 print(f"Warning: Could not find word '{word}' in text to highlight")
