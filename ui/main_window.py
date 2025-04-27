@@ -3,6 +3,7 @@ Main window module for the Audiobook Reader application.
 """
 
 import os
+import time
 from typing import Dict, List, Optional, Tuple, Union
 
 from PyQt6.QtCore import QTimer, Qt, pyqtSlot, QSize, QUrl
@@ -13,6 +14,18 @@ from PyQt6.QtWidgets import (
     QLabel, QSlider, QComboBox, QMessageBox, QProgressBar
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QAudioFormat, QMediaDevices
+
+
+def format_time(seconds: float) -> str:
+    """Format seconds as HH:MM:SS."""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    else:
+        return f"{minutes:02d}:{secs:02d}"
 
 from core.audio_processor import AudioProcessor
 from core.text_processor import TextProcessor
@@ -42,6 +55,10 @@ class MainWindow(QMainWindow):
         self.tts_engine = KokoroOnnxEngine()
         self.state_manager = StateManager()
         self.thread_manager = ThreadManager()
+
+        # Initialize bookmark
+        self.bookmark_position = 0.0
+        self.bookmark_text_position = 0
 
         # Initialize media player
         self.media_player = QMediaPlayer()
@@ -139,6 +156,17 @@ class MainWindow(QMainWindow):
         import_file_action.setToolTip("Import text file (TXT, MD, DOCX, PDF, etc.)")
         import_file_action.triggered.connect(self.import_file)
         toolbar.addAction(import_file_action)
+
+        # Add bookmark actions
+        self.add_bookmark_action = QAction("Add Bookmark", self)
+        self.add_bookmark_action.setToolTip("Save current position as bookmark")
+        self.add_bookmark_action.triggered.connect(self.add_bookmark)
+        toolbar.addAction(self.add_bookmark_action)
+
+        self.goto_bookmark_action = QAction("Go to Bookmark", self)
+        self.goto_bookmark_action.setToolTip("Jump to saved bookmark position")
+        self.goto_bookmark_action.triggered.connect(self.goto_bookmark)
+        toolbar.addAction(self.goto_bookmark_action)
 
         settings_action = QAction(settings_icon, "Settings", self)
         settings_action.setToolTip("Configure voice, speed, and other settings")
@@ -675,6 +703,15 @@ class MainWindow(QMainWindow):
                 print("Text content changed. Will re-synthesize on play.")
                 self.status_bar.showMessage("Text edited. Will re-synthesize on play.")
 
+                # Stop any existing progressive playback
+                if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
+                    self.tts_engine.stop_requested = True
+                    # Wait for the thread to finish
+                    self.synthesis_thread.join(0.5)
+
+                # Clear the current audio path to force a complete re-synthesis
+                self.current_audio_path = None
+
     def toggle_playback(self):
         """Toggle playback between play and pause."""
         print(f"Toggle playback called. Current audio path: {self.current_audio_path}")
@@ -729,6 +766,72 @@ class MainWindow(QMainWindow):
                             self.status_bar.showMessage(f"Playback error: {self.media_player.errorString()}")
                         else:
                             print("Playback started successfully")
+
+    def add_bookmark(self):
+        """Save the current position as a bookmark."""
+        if not self.current_text:
+            self.status_bar.showMessage("No text loaded. Cannot add bookmark.")
+            return
+
+        # Get current position
+        if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
+            # For progressive playback, use the TTS engine's current position
+            self.bookmark_position = self.tts_engine.current_position
+        else:
+            # For media player playback, convert from milliseconds to seconds
+            self.bookmark_position = self.media_player.position() / 1000
+
+        # Get current text cursor position
+        self.bookmark_text_position = self.text_display.textCursor().position()
+
+        # Save to state manager
+        self.state_manager.set("bookmark", {
+            "position": self.bookmark_position,
+            "text_position": self.bookmark_text_position,
+            "file_path": self.current_file_path,
+            "text": self.current_text[:100] + "..." if len(self.current_text) > 100 else self.current_text
+        })
+
+        # Update UI
+        self.status_bar.showMessage(f"Bookmark added at position {format_time(self.bookmark_position)}")
+
+    def goto_bookmark(self):
+        """Jump to the saved bookmark position."""
+        # Get bookmark from state manager
+        bookmark = self.state_manager.get("bookmark")
+        if not bookmark:
+            self.status_bar.showMessage("No bookmark saved.")
+            return
+
+        # Check if the current file matches the bookmarked file
+        if self.current_file_path != bookmark.get("file_path"):
+            # Ask if the user wants to load the bookmarked file
+            response = QMessageBox.question(
+                self,
+                "Load Bookmarked File",
+                f"The bookmark is for a different file. Do you want to load it?\n\n{bookmark.get('file_path')}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+
+            if response == QMessageBox.StandardButton.Yes:
+                # Load the file
+                self.load_file(bookmark.get("file_path"))
+            else:
+                return
+
+        # Set text cursor position
+        cursor = self.text_display.textCursor()
+        cursor.setPosition(bookmark.get("text_position", 0))
+        self.text_display.setTextCursor(cursor)
+        self.text_display.ensureCursorVisible()
+
+        # Set media position
+        if self.current_audio_path:
+            position_ms = int(bookmark.get("position", 0) * 1000)
+            self.media_player.setPosition(position_ms)
+
+        # Update UI
+        self.status_bar.showMessage(f"Jumped to bookmark at {format_time(bookmark.get('position', 0))}")
 
     def show_settings(self):
         """Show the settings dialog."""

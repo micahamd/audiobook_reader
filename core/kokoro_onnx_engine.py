@@ -41,10 +41,12 @@ class KokoroOnnxEngine:
         self.model_path = model_path or os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models', 'kokoro', 'kokoro-v0_19.onnx')
         self.voices_path = voices_path or os.path.join(os.path.dirname(os.path.dirname(__file__)), 'models', 'kokoro', 'voices.json')
         self.temp_dir = temp_dir or os.path.join(os.path.dirname(os.path.dirname(__file__)), 'temp')
+        self.chunks_dir = os.path.join(self.temp_dir, 'chunks')
 
         # Ensure directories exist
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
         os.makedirs(self.temp_dir, exist_ok=True)
+        os.makedirs(self.chunks_dir, exist_ok=True)
 
         self.kokoro = None
         self.current_text = ""
@@ -54,10 +56,11 @@ class KokoroOnnxEngine:
         self.audio_thread = None
 
         # For progressive playback
-        self.chunk_size = 500  # Number of words per chunk
+        self.chunk_size = 100  # Smaller chunks for faster initial playback
         self.audio_queue = queue.Queue()
         self.synthesis_complete = False
         self.current_position = 0.0
+        self.chunk_files = []  # Keep track of chunk files
 
     def load_model(self):
         """Load the Kokoro model."""
@@ -146,27 +149,21 @@ class KokoroOnnxEngine:
             warnings.warn(f"Failed to synthesize speech: {str(e)}. Using fallback synthesis.")
             return self._dummy_synthesize(text, speed)
 
-    def _dummy_synthesize(self, text: str, speed: float = 1.0) -> Tuple[str, List[Dict[str, Union[str, float]]]]:
+    def _generate_dummy_audio(self, text: str, speed: float = 1.0) -> Tuple[np.ndarray, List[Dict[str, Union[str, float]]], float]:
         """
-        Create a dummy audio file and word timings when TTS is not available.
+        Generate dummy audio and word timings when TTS is not available.
 
         Args:
             text: The text to synthesize.
             speed: The speed factor.
 
         Returns:
-            Tuple of (audio_path, word_timings)
+            Tuple of (audio_samples, word_timings, duration)
         """
         # Create a simple sine wave as dummy audio
-        sample_rate = 24000  # Kokoro's sample rate
         duration = len(text.split()) * 0.3 / speed  # Rough estimate: 0.3 seconds per word
-        t = np.linspace(0, duration, int(sample_rate * duration), False)
+        t = np.linspace(0, duration, int(self.SAMPLE_RATE * duration), False)
         audio = 0.5 * np.sin(2 * np.pi * 440 * t)  # 440 Hz sine wave
-
-        # Save to a temporary file
-        temp_file = tempfile.NamedTemporaryFile(suffix='.wav', dir=self.temp_dir, delete=False)
-        temp_file.close()
-        sf.write(temp_file.name, audio, sample_rate)
 
         # Create word timings
         words = text.split()
@@ -182,9 +179,31 @@ class KokoroOnnxEngine:
             })
             current_time += word_duration
 
-        self.word_timings = word_timings
+        return audio, word_timings, duration
 
-        return temp_file.name, word_timings
+    def _dummy_synthesize(self, text: str, speed: float = 1.0) -> Tuple[str, List[Dict[str, Union[str, float]]]]:
+        """
+        Create a dummy audio file and word timings when TTS is not available.
+
+        Args:
+            text: The text to synthesize.
+            speed: The speed factor.
+
+        Returns:
+            Tuple of (audio_path, word_timings)
+        """
+        # Generate dummy audio
+        audio, word_timings, _ = self._generate_dummy_audio(text, speed)
+
+        # Save to a file in the chunks directory
+        chunk_filename = f"dummy_{int(time.time())}.wav"
+        chunk_path = os.path.join(self.chunks_dir, chunk_filename)
+        sf.write(chunk_path, audio, self.SAMPLE_RATE)
+
+        self.word_timings = word_timings
+        self.chunk_files.append(chunk_path)
+
+        return chunk_path, word_timings
 
     def _extract_word_timings(self, words: List[str], duration: float) -> List[Dict[str, Union[str, float]]]:
         """
@@ -343,6 +362,9 @@ class KokoroOnnxEngine:
             except queue.Empty:
                 break
 
+        # Clean up old chunk files
+        self._clean_chunk_files()
+
         # Start the synthesis thread
         synthesis_thread = threading.Thread(
             target=self._synthesize_chunks,
@@ -359,6 +381,19 @@ class KokoroOnnxEngine:
         playback_thread.start()
 
         return synthesis_thread, playback_thread
+
+    def _clean_chunk_files(self):
+        """Clean up old chunk files."""
+        # Clear the chunk files list
+        self.chunk_files = []
+
+        # Remove old chunk files
+        for file in os.listdir(self.chunks_dir):
+            if file.endswith('.wav'):
+                try:
+                    os.remove(os.path.join(self.chunks_dir, file))
+                except Exception as e:
+                    warnings.warn(f"Failed to remove chunk file {file}: {str(e)}")
 
     def _synthesize_chunks(self, text: str, voice: str, speed: float, callback=None):
         """
@@ -398,9 +433,10 @@ class KokoroOnnxEngine:
                 # Generate speech for this chunk
                 print(f"Synthesizing chunk {i+1}/{total_chunks}")
 
-                # Create a temporary file for the audio
-                temp_file = tempfile.NamedTemporaryFile(suffix='.wav', dir=self.temp_dir, delete=False)
-                temp_file.close()
+                # Create a file for the audio in the chunks directory
+                chunk_filename = f"chunk_{i:04d}_{int(time.time())}.wav"
+                chunk_path = os.path.join(self.chunks_dir, chunk_filename)
+                self.chunk_files.append(chunk_path)
 
                 # Generate speech
                 samples, sample_rate = self.kokoro.create(
@@ -408,7 +444,7 @@ class KokoroOnnxEngine:
                 )
 
                 # Save the audio to a file
-                sf.write(temp_file.name, samples, sample_rate)
+                sf.write(chunk_path, samples, sample_rate)
 
                 # Calculate duration
                 duration = len(samples) / sample_rate
@@ -423,7 +459,7 @@ class KokoroOnnxEngine:
                     timing["end"] += time_offset
 
                 # Add to the queue
-                self.audio_queue.put((i, total_chunks, temp_file.name, word_timings))
+                self.audio_queue.put((i, total_chunks, chunk_path, word_timings))
 
                 # Update the global word timings
                 all_word_timings.extend(word_timings)
@@ -433,12 +469,21 @@ class KokoroOnnxEngine:
 
                 # Call the callback if provided
                 if callback:
-                    callback(i, total_chunks, temp_file.name, word_timings)
+                    callback(i, total_chunks, chunk_path, word_timings)
 
             except Exception as e:
                 warnings.warn(f"Failed to synthesize chunk {i}: {str(e)}")
                 # Use fallback for this chunk
-                dummy_path, dummy_timings = self._dummy_synthesize(chunk, speed)
+                # Create a file for the audio in the chunks directory
+                chunk_filename = f"chunk_dummy_{i:04d}_{int(time.time())}.wav"
+                chunk_path = os.path.join(self.chunks_dir, chunk_filename)
+                self.chunk_files.append(chunk_path)
+
+                # Generate dummy audio
+                dummy_audio, dummy_timings, dummy_duration = self._generate_dummy_audio(chunk, speed)
+
+                # Save to file
+                sf.write(chunk_path, dummy_audio, self.SAMPLE_RATE)
 
                 # Adjust timings based on offset
                 for timing in dummy_timings:
@@ -446,18 +491,17 @@ class KokoroOnnxEngine:
                     timing["end"] += time_offset
 
                 # Add to the queue
-                self.audio_queue.put((i, total_chunks, dummy_path, dummy_timings))
+                self.audio_queue.put((i, total_chunks, chunk_path, dummy_timings))
 
                 # Update the global word timings
                 all_word_timings.extend(dummy_timings)
 
                 # Update the time offset
-                dummy_duration = dummy_timings[-1]["end"] - dummy_timings[0]["start"] if dummy_timings else 0
                 time_offset += dummy_duration
 
                 # Call the callback if provided
                 if callback:
-                    callback(i, total_chunks, dummy_path, dummy_timings)
+                    callback(i, total_chunks, chunk_path, dummy_timings)
 
         # Store the complete word timings
         self.word_timings = all_word_timings
