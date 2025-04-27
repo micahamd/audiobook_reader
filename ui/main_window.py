@@ -436,7 +436,7 @@ class MainWindow(QMainWindow):
             self.is_playing = True
             self.play_button.setIcon(self.pause_icon)
             self.text_display.setReadOnly(True)
-            self.highlight_timer.start(100)  # Update highlight every 100ms
+            self.highlight_timer.start(250)  # Update highlight every 250ms (slower)
 
             # Reset the last highlighted index
             if hasattr(self, 'last_highlighted_index'):
@@ -657,131 +657,135 @@ class MainWindow(QMainWindow):
 
     def update_highlight(self):
         """Update the text highlighting based on the current playback position."""
-        if not self.word_timings or not self.is_playing:
-            return
+        try:
+            if not self.word_timings or not self.is_playing:
+                return
 
-        # Get current time - either from media player or from TTS engine
-        if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
-            # For progressive playback, use the TTS engine's current position
-            current_time = self.tts_engine.current_position
-        else:
-            # For media player playback, convert from milliseconds to seconds
-            current_time = self.media_player.position() / 1000
+            # Get current time - either from media player or from TTS engine
+            if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
+                # For progressive playback, use the TTS engine's current position
+                current_time = self.tts_engine.current_position
+            else:
+                # For media player playback, convert from milliseconds to seconds
+                current_time = self.media_player.position() / 1000
 
-        # Find the current word index based on time
-        current_word_index = -1
-        for i, timing in enumerate(self.word_timings):
-            if timing["start"] <= current_time <= timing["end"]:
-                current_word_index = i
-                break
-
-        # If we didn't find an exact match, find the closest word
-        if current_word_index == -1:
-            # Find the word that's about to be spoken
+            # Find the current word index based on time
+            current_word_index = -1
             for i, timing in enumerate(self.word_timings):
-                if timing["start"] > current_time:
-                    if i > 0:
-                        current_word_index = i - 1
-                    else:
-                        current_word_index = 0
+                if timing["start"] <= current_time <= timing["end"]:
+                    current_word_index = i
                     break
 
-        # If we still don't have a word, use the last word
-        if current_word_index == -1 and self.word_timings:
-            current_word_index = len(self.word_timings) - 1
+            # If we didn't find an exact match, find the closest word
+            if current_word_index == -1:
+                # Find the word that's about to be spoken
+                for i, timing in enumerate(self.word_timings):
+                    if timing["start"] > current_time:
+                        if i > 0:
+                            current_word_index = i - 1
+                        else:
+                            current_word_index = 0
+                        break
 
-        # If we have a valid word index, highlight it
-        if current_word_index >= 0 and current_word_index < len(self.word_timings):
-            current_word = self.word_timings[current_word_index]
+            # If we still don't have a word, use the last word
+            if current_word_index == -1 and self.word_timings:
+                current_word_index = len(self.word_timings) - 1
 
-            # Store the current word index to avoid unnecessary updates
-            if hasattr(self, 'last_highlighted_index') and self.last_highlighted_index == current_word_index:
-                return  # Skip if we're already highlighting this word
+            # If we have a valid word index, highlight it
+            if current_word_index >= 0 and current_word_index < len(self.word_timings):
+                current_word = self.word_timings[current_word_index]
 
-            self.last_highlighted_index = current_word_index
+                # Store the current word index to avoid unnecessary updates
+                if hasattr(self, 'last_highlighted_index') and self.last_highlighted_index == current_word_index:
+                    return  # Skip if we're already highlighting this word
 
-            # Get the word to highlight
-            word = current_word["word"]
+                self.last_highlighted_index = current_word_index
 
-            # Save the current cursor position and scroll position
-            old_cursor = self.text_display.textCursor()
-            old_scroll_value = self.text_display.verticalScrollBar().value()
+                # Get the word to highlight
+                word = current_word["word"]
 
-            # Clear previous highlighting
-            clear_cursor = QTextCursor(self.text_display.document())
-            clear_cursor.select(QTextCursor.SelectionType.Document)
-            clear_cursor.setCharFormat(QTextCharFormat())
+                # Save the current cursor position and scroll position
+                old_cursor = self.text_display.textCursor()
+                old_scroll_value = self.text_display.verticalScrollBar().value()
 
-            # Create a format for highlighting
-            highlight_format = QTextCharFormat()
-            highlight_format.setBackground(QColor(255, 255, 0, 200))  # Brighter yellow
-            highlight_format.setForeground(QColor(0, 0, 0))  # Black text
+                # Clear previous highlighting
+                clear_cursor = QTextCursor(self.text_display.document())
+                clear_cursor.select(QTextCursor.SelectionType.Document)
+                clear_cursor.setCharFormat(QTextCharFormat())
 
-            # Calculate approximate position in text
-            # This is more efficient than searching through the entire text
-            words_before = current_word_index
-            approx_char_pos = min(words_before * 6, self.text_display.document().characterCount() - 1)  # Estimate 6 chars per word
+                # Create a format for highlighting
+                highlight_format = QTextCharFormat()
+                highlight_format.setBackground(QColor(255, 255, 0, 200))  # Brighter yellow
+                highlight_format.setForeground(QColor(0, 0, 0))  # Black text
 
-            # Start searching from the approximate position
-            cursor = QTextCursor(self.text_display.document())
-            cursor.setPosition(max(0, approx_char_pos - 100))  # Start a bit before the estimated position
+                # Calculate approximate position in text
+                # This is more efficient than searching through the entire text
+                words_before = current_word_index
+                approx_char_pos = min(words_before * 6, self.text_display.document().characterCount() - 1)  # Estimate 6 chars per word
 
-            # Find and highlight the word
-            found = False
-            search_count = 0
-            max_searches = 200  # Limit searches to avoid performance issues
+                # Start searching from the approximate position
+                cursor = QTextCursor(self.text_display.document())
+                cursor.setPosition(max(0, approx_char_pos - 100))  # Start a bit before the estimated position
 
-            while not found and search_count < max_searches:
-                search_count += 1
+                # Find and highlight the word
+                found = False
+                search_count = 0
+                max_searches = 200  # Limit searches to avoid performance issues
 
-                # Find the next occurrence of the word
-                search_result = self.text_display.document().find(
-                    word,
-                    cursor,
-                    QTextDocument.FindFlag.FindCaseSensitively
-                )
+                while not found and search_count < max_searches:
+                    search_count += 1
 
-                if search_result.isNull():
-                    # If not found with exact case, try case-insensitive
-                    cursor.setPosition(max(0, approx_char_pos - 100))
+                    # Find the next occurrence of the word
                     search_result = self.text_display.document().find(
                         word,
                         cursor,
-                        QTextDocument.FindFlag.FindWholeWords
+                        QTextDocument.FindFlag.FindCaseSensitively
                     )
 
-                if not search_result.isNull():
-                    # Apply highlighting
-                    search_result.setCharFormat(highlight_format)
+                    if search_result.isNull():
+                        # If not found with exact case, try case-insensitive
+                        cursor.setPosition(max(0, approx_char_pos - 100))
+                        search_result = self.text_display.document().find(
+                            word,
+                            cursor,
+                            QTextDocument.FindFlag.FindWholeWords
+                        )
 
-                    # Create a cursor at the highlighted position for scrolling
-                    highlight_cursor = QTextCursor(search_result)
+                    if not search_result.isNull():
+                        # Apply highlighting
+                        search_result.setCharFormat(highlight_format)
 
-                    # Only scroll if we're in playback mode
-                    if self.is_playing:
-                        # Set the cursor to ensure the highlighted word is visible
-                        self.text_display.setTextCursor(highlight_cursor)
+                        # Create a cursor at the highlighted position for scrolling
+                        highlight_cursor = QTextCursor(search_result)
 
-                        # Scroll to make the highlighted word visible
-                        self.text_display.ensureCursorVisible()
+                        # Only scroll if we're in playback mode
+                        if self.is_playing:
+                            # Set the cursor to ensure the highlighted word is visible
+                            self.text_display.setTextCursor(highlight_cursor)
 
-                    found = True
-                    break
-                else:
-                    # If not found near the estimated position, try from the beginning
-                    if search_count == 1:
-                        cursor.setPosition(0)
+                            # Scroll to make the highlighted word visible
+                            self.text_display.ensureCursorVisible()
+
+                        found = True
+                        break
                     else:
-                        # Move forward and try again
-                        cursor.movePosition(QTextCursor.MoveOperation.NextWord)
+                        # If not found near the estimated position, try from the beginning
+                        if search_count == 1:
+                            cursor.setPosition(0)
+                        else:
+                            # Move forward and try again
+                            cursor.movePosition(QTextCursor.MoveOperation.NextWord)
 
-            # If we're not in playback mode, restore the original cursor and scroll position
-            if not self.is_playing:
-                self.text_display.setTextCursor(old_cursor)
-                self.text_display.verticalScrollBar().setValue(old_scroll_value)
+                # If we're not in playback mode, restore the original cursor and scroll position
+                if not self.is_playing:
+                    self.text_display.setTextCursor(old_cursor)
+                    self.text_display.verticalScrollBar().setValue(old_scroll_value)
 
-            if not found:
-                print(f"Warning: Could not find word '{word}' in text to highlight")
+                if not found:
+                    print(f"Warning: Could not find word '{word}' in text to highlight")
+        except Exception as e:
+            print(f"Error in update_highlight: {str(e)}")
+            # Don't let highlighting errors crash the application
 
     def on_text_changed(self):
         """Handle text changes in the text display."""
@@ -896,7 +900,7 @@ class MainWindow(QMainWindow):
                             self.tts_engine.pause_requested = False
                             self.play_button.setIcon(self.pause_icon)
                             self.text_display.setReadOnly(True)
-                            self.highlight_timer.start(100)
+                            self.highlight_timer.start(250)  # Slower highlighting
                             self.is_playing = True
                             self.status_bar.showMessage(f"Rewound to position {format_time(target_time)}")
                         else:
@@ -906,7 +910,7 @@ class MainWindow(QMainWindow):
                             self.media_player.play()
                             self.play_button.setIcon(self.pause_icon)
                             self.text_display.setReadOnly(True)
-                            self.highlight_timer.start(100)
+                            self.highlight_timer.start(250)  # Slower highlighting
                             self.is_playing = True
                             self.status_bar.showMessage(f"Rewound to position {format_time(target_time)}")
                     else:
@@ -930,7 +934,7 @@ class MainWindow(QMainWindow):
             # Update UI
             self.play_button.setIcon(self.pause_icon)
             self.text_display.setReadOnly(True)
-            self.highlight_timer.start(100)
+            self.highlight_timer.start(250)  # Slower highlighting
             self.is_playing = True
             self.status_bar.showMessage("Resuming playback...")
         else:
@@ -950,7 +954,7 @@ class MainWindow(QMainWindow):
                     # Update UI
                     self.play_button.setIcon(self.pause_icon)
                     self.text_display.setReadOnly(True)
-                    self.highlight_timer.start(100)
+                    self.highlight_timer.start(250)  # Slower highlighting
                     self.is_playing = True
                     print("Playback started successfully")
 
