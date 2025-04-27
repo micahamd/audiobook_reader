@@ -339,14 +339,106 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to load file: {str(e)}")
 
     def synthesize_speech(self):
-        """Synthesize speech from the current text using chunked processing."""
+        """Synthesize speech from the current text."""
+        if not self.current_text:
+            return
+
+        # Get TTS settings
+        tts_settings = self.state_manager.get("tts_settings", {})
+        voice = tts_settings.get("voice", "af_sarah")
+        speed = tts_settings.get("speed", 1.0)
+
+        # Stop any existing playback
+        if self.is_playing:
+            self.media_player.stop()
+
+        # Stop any existing TTS processes
+        self.tts_engine.stop_requested = True
+
+        # Show progress
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.status_bar.showMessage("Synthesizing speech... (will start playing automatically)")
+
+        # Define callback for chunk progress
+        def chunk_callback(chunk_index, total_chunks, audio_path, word_timings):
+            # Update progress
+            progress = int((chunk_index + 1) / total_chunks * 100)
+            self.progress_bar.setValue(progress)
+
+            # If this is the first chunk, start playback
+            if chunk_index == 0:
+                self.handle_first_chunk(audio_path, word_timings)
+
+        try:
+            # Start progressive synthesis and playback
+            self.synthesis_thread, self.playback_thread = self.tts_engine.synthesize_and_play_progressively(
+                self.current_text,
+                voice=voice,
+                speed=speed,
+                callback=chunk_callback
+            )
+
+            # Update UI state
+            self.is_playing = True
+            self.play_button.setIcon(self.pause_icon)
+            self.text_display.setReadOnly(True)
+            self.highlight_timer.start(100)  # Update highlight every 100ms
+
+        except Exception as e:
+            # Handle errors
+            self.progress_bar.setVisible(False)
+            self.status_bar.showMessage(f"Error: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to synthesize speech: {str(e)}")
+
+            # Fallback to non-progressive synthesis
+            self.fallback_synthesis(voice, speed)
+
+    def handle_first_chunk(self, audio_path, word_timings):
+        """
+        Handle the first audio chunk.
+
+        Args:
+            audio_path: Path to the audio file.
+            word_timings: Word timing information.
+        """
+        print(f"First chunk ready. Audio path: {audio_path}")
+
+        # Store the audio path and word timings
+        self.current_audio_path = audio_path
+        self.word_timings = word_timings
+
+        # Update status
+        self.status_bar.showMessage("Starting playback...")
+
+    def fallback_synthesis(self, voice, speed):
+        """
+        Fallback to non-progressive synthesis.
+
+        Args:
+            voice: The voice to use.
+            speed: The speed factor.
+        """
         def synthesize_task(progress_callback):
+            """
+            Task for synthesizing speech.
+
+            Args:
+                progress_callback: Callback for reporting progress.
+
+            Returns:
+                Tuple of (audio_path, word_timings).
+            """
             progress_callback.emit(10)
 
-            # Get TTS settings
-            tts_settings = self.state_manager.get("tts_settings", {})
-            voice = tts_settings.get("voice", "default")
-            speed = tts_settings.get("speed", 1.0)
+            # Prepare text
+            progress_callback.emit(20)
+
+            # Initialize TTS engine
+            progress_callback.emit(30)
+
+            # Synthesize speech
+            progress_callback.emit(50)
 
             try:
                 # Synthesize using the chunked approach
@@ -367,7 +459,7 @@ class MainWindow(QMainWindow):
                     "TTS Dependencies Missing",
                     "Some TTS dependencies are missing. Using a simple tone instead of speech synthesis.\n\n"
                     "To enable full TTS functionality, please install the required packages:\n"
-                    "pip install torch transformers"
+                    "pip install kokoro-onnx"
                 )
 
                 # Use dummy synthesis
@@ -511,7 +603,13 @@ class MainWindow(QMainWindow):
         if not self.word_timings or not self.is_playing:
             return
 
-        current_time = self.media_player.position() / 1000  # Convert to seconds
+        # Get current time - either from media player or from TTS engine
+        if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
+            # For progressive playback, use the TTS engine's current position
+            current_time = self.tts_engine.current_position
+        else:
+            # For media player playback, convert from milliseconds to seconds
+            current_time = self.media_player.position() / 1000
 
         # Get the current word from the TTS engine
         current_word = self.tts_engine.get_word_at_position(current_time)
@@ -532,6 +630,7 @@ class MainWindow(QMainWindow):
             # Create a format for highlighting
             highlight_format = QTextCharFormat()
             highlight_format.setBackground(QColor(255, 255, 0, 100))  # Light yellow
+            highlight_format.setForeground(QColor(0, 0, 0))  # Black text
 
             # Find and highlight the word
             found = False
@@ -581,13 +680,22 @@ class MainWindow(QMainWindow):
         print(f"Toggle playback called. Current audio path: {self.current_audio_path}")
         print(f"Is playing: {self.is_playing}, Text edited: {self.text_edited}")
 
-        if not self.current_audio_path:
-            self.status_bar.showMessage("No audio available. Please import a file first.")
+        if not self.current_text:
+            self.status_bar.showMessage("No text available. Please import a file first.")
             return
 
         if self.is_playing:
             print("Pausing playback")
+            # Toggle pause in the TTS engine for progressive playback
+            self.tts_engine.toggle_pause()
+            # Also pause the media player for non-progressive playback
             self.media_player.pause()
+            # Update UI
+            self.play_button.setIcon(self.play_icon)
+            self.text_display.setReadOnly(False)
+            self.highlight_timer.stop()
+            self.is_playing = False
+            self.status_bar.showMessage("Paused. Text is now editable.")
         else:
             # Check if text was edited and needs re-synthesis
             if self.text_edited:
@@ -596,15 +704,31 @@ class MainWindow(QMainWindow):
                 self.synthesize_speech()
             else:
                 print("Starting playback")
-                self.media_player.play()
-
-                # Check if playback actually started
-                if self.media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-                    print(f"Playback failed to start. Media player state: {self.media_player.playbackState()}")
-                    print(f"Media player error: {self.media_player.error()}")
-                    self.status_bar.showMessage(f"Playback error: {self.media_player.errorString()}")
+                # If we're using progressive playback
+                if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
+                    # Resume the paused playback
+                    self.tts_engine.toggle_pause()
+                    # Update UI
+                    self.play_button.setIcon(self.pause_icon)
+                    self.text_display.setReadOnly(True)
+                    self.highlight_timer.start(100)
+                    self.is_playing = True
+                    self.status_bar.showMessage("Resuming playback...")
                 else:
-                    print("Playback started successfully")
+                    # Start new synthesis if no current playback
+                    if not self.current_audio_path:
+                        self.synthesize_speech()
+                    else:
+                        # Use the media player for non-progressive playback
+                        self.media_player.play()
+
+                        # Check if playback actually started
+                        if self.media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                            print(f"Playback failed to start. Media player state: {self.media_player.playbackState()}")
+                            print(f"Media player error: {self.media_player.error()}")
+                            self.status_bar.showMessage(f"Playback error: {self.media_player.errorString()}")
+                        else:
+                            print("Playback started successfully")
 
     def show_settings(self):
         """Show the settings dialog."""
