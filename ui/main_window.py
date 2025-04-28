@@ -15,6 +15,9 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QAudioFormat, QMediaDevices
 
+from ui.virtual_text_display import VirtualTextDisplay
+from core.background_processor import BackgroundProcessor
+
 
 def format_time(seconds: float) -> str:
     """Format seconds as HH:MM:SS."""
@@ -66,6 +69,12 @@ class MainWindow(QMainWindow):
         self.current_page_index = 0
         self.page_size = 5000  # Characters per page (adjustable)
 
+        # Initialize background processor
+        self.background_processor = BackgroundProcessor()
+
+        # Track pre-processed pages
+        self.preprocessed_pages = set()
+
         # Initialize media player
         self.media_player = QMediaPlayer()
         self.audio_output = QAudioOutput()
@@ -77,6 +86,7 @@ class MainWindow(QMainWindow):
         self.current_text = ""
         self.word_timings = []
         self.is_playing = False
+        self.auto_play = False  # Don't auto-play when loading files
         self.highlight_timer = QTimer()
         self.highlight_timer.timeout.connect(self.update_highlight)
 
@@ -102,11 +112,12 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        # Create text display
-        self.text_display = QTextEdit()
+        # Create virtual text display for efficient handling of large texts
+        self.text_display = VirtualTextDisplay()
         self.text_display.setReadOnly(True)  # Initially read-only, will be made editable when paused
         self.text_display.setFont(QFont("Arial", 12))
-        self.text_display.textChanged.connect(self.on_text_changed)
+        self.text_display.text_edited.connect(self.on_text_changed)
+        self.text_display.content_changed.connect(self.on_content_changed)
         main_layout.addWidget(self.text_display)
 
         # Create playback controls
@@ -359,8 +370,15 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("Transcription complete")
         self.progress_bar.setVisible(False)
 
-        # Synthesize speech
-        self.synthesize_speech()
+        # Prepare speech synthesis but don't auto-play
+        if self.auto_play:
+            # Only auto-play if explicitly enabled
+            self.synthesize_speech()
+        else:
+            # Just prepare the text without playing
+            self.text_edited = True
+            self.text_display.setReadOnly(False)
+            self.status_bar.showMessage("Transcription complete. Press play to start synthesis.")
 
     def load_file(self, file_path: str):
         """
@@ -392,8 +410,14 @@ class MainWindow(QMainWindow):
             self.text_display.setReadOnly(False)
             self.status_bar.showMessage("Text is editable. Edit as needed, then press Play to synthesize.")
 
-            # Synthesize speech
-            self.synthesize_speech()
+            # Prepare speech synthesis but don't auto-play
+            if self.auto_play:
+                # Only auto-play if explicitly enabled
+                self.synthesize_speech()
+            else:
+                # Just prepare the text without playing
+                self.text_edited = True
+                print("File loaded. Press play to start synthesis.")
 
             self.status_bar.showMessage(f"Loaded file: {os.path.basename(file_path)}")
             self.progress_bar.setVisible(False)
@@ -403,8 +427,13 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("")
             QMessageBox.critical(self, "Error", f"Failed to load file: {str(e)}")
 
-    def synthesize_speech(self):
-        """Synthesize speech from the current page."""
+    def synthesize_speech(self, start_position=None):
+        """
+        Synthesize speech from the current page.
+
+        Args:
+            start_position: Optional position in the text to start synthesis from.
+        """
         if not self.pages or self.current_page_index >= len(self.pages):
             return
 
@@ -412,12 +441,39 @@ class MainWindow(QMainWindow):
         current_page_text = self.text_display.toPlainText()
 
         # Save any edits to the current page
-        self.pages[self.current_page_index] = current_page_text
+        if not self.text_display.isReadOnly():
+            self.pages[self.current_page_index] = current_page_text
 
         # If the page is empty, don't synthesize
         if not current_page_text.strip():
             self.status_bar.showMessage("No text to synthesize on this page.")
             return
+
+        # Check if this page has been preprocessed
+        task_id = f"page_{self.current_page_index}"
+        preprocessed_result = self.background_processor.get_result(task_id)
+
+        if preprocessed_result:
+            print(f"Using preprocessed content for synthesis of page {self.current_page_index}")
+            # We have preprocessed content, use it
+            self.current_audio_path = preprocessed_result.get("audio_path")
+            self.word_timings = preprocessed_result.get("word_timings")
+
+            # If we have a valid audio path, we can skip synthesis and just play
+            if self.current_audio_path and os.path.exists(self.current_audio_path):
+                print(f"Using cached audio: {self.current_audio_path}")
+                # Convert the file path to a QUrl
+                file_url = QUrl.fromLocalFile(self.current_audio_path)
+                self.media_player.setSource(file_url)
+                self.media_player.play()
+
+                # Update UI
+                self.play_button.setIcon(self.pause_icon)
+                self.text_display.setReadOnly(True)
+                self.highlight_timer.start(250)  # Slower highlighting
+                self.is_playing = True
+                self.status_bar.showMessage(f"Playing page {self.current_page_index + 1} (using cached audio)")
+                return
 
         # Get TTS settings
         tts_settings = self.state_manager.get("tts_settings", {})
@@ -461,6 +517,19 @@ class MainWindow(QMainWindow):
             # If this is the first chunk, start playback
             if chunk_index == 0:
                 self.handle_first_chunk(audio_path, word_timings)
+
+                # If we have a start position, set it
+                if start_position is not None and word_timings:
+                    # Find the closest word timing to the start position
+                    try:
+                        closest_pos = min(word_timings.keys(), key=lambda x: abs(x - start_position))
+                        time_sec = word_timings[closest_pos]
+                        print(f"Setting initial playback position to {time_sec}s based on cursor at position {start_position}")
+
+                        # Set the position in the TTS engine
+                        self.tts_engine.set_position(time_sec)
+                    except Exception as e:
+                        print(f"Error setting initial position: {str(e)}")
 
         try:
             # Clear the cache first to avoid any conflicts
@@ -845,6 +914,89 @@ class MainWindow(QMainWindow):
             # Start the timer to trigger re-synthesis after a delay
             self.edit_timer.start(2000)  # 2 seconds delay
 
+    def on_content_changed(self):
+        """Handle content changes in the virtual text display."""
+        # This is called when the visible content changes due to scrolling
+        # We can use this to trigger background processing of nearby pages
+        self.preprocess_nearby_pages()
+
+    def preprocess_nearby_pages(self):
+        """Preprocess nearby pages in the background."""
+        if not self.pages:
+            return
+
+        # Get the current page index
+        current_index = self.current_page_index
+
+        # Define a function to preprocess a page
+        def preprocess_page(page_text, voice, speed):
+            """Preprocess a page of text."""
+            try:
+                # Synthesize the page
+                audio_path, word_timings = self.tts_engine.synthesize(
+                    page_text,
+                    voice=voice,
+                    speed=speed
+                )
+                return {
+                    "audio_path": audio_path,
+                    "word_timings": word_timings
+                }
+            except Exception as e:
+                print(f"Error preprocessing page: {str(e)}")
+                return None
+
+        # Get TTS settings
+        tts_settings = self.state_manager.get("tts_settings", {})
+        voice = tts_settings.get("voice", "af_sarah")
+        speed = tts_settings.get("speed", 1.0)
+
+        # Preprocess the next page if available
+        if current_index + 1 < len(self.pages) and current_index + 1 not in self.preprocessed_pages:
+            next_page = self.pages[current_index + 1]
+            task_id = f"page_{current_index + 1}"
+
+            # Add the task to the background processor
+            self.background_processor.add_task(
+                task_id,
+                preprocess_page,
+                1,  # priority (higher priority for the next page)
+                self.handle_preprocessed_page,  # callback
+                next_page,
+                voice,
+                speed
+            )
+
+            # Mark the page as being preprocessed
+            self.preprocessed_pages.add(current_index + 1)
+            print(f"Preprocessing page {current_index + 1}")
+
+        # Preprocess the previous page if available
+        if current_index > 0 and current_index - 1 not in self.preprocessed_pages:
+            prev_page = self.pages[current_index - 1]
+            task_id = f"page_{current_index - 1}"
+
+            # Add the task to the background processor
+            self.background_processor.add_task(
+                task_id,
+                preprocess_page,
+                2,  # priority (lower priority for the previous page)
+                self.handle_preprocessed_page,  # callback
+                prev_page,
+                voice,
+                speed
+            )
+
+            # Mark the page as being preprocessed
+            self.preprocessed_pages.add(current_index - 1)
+            print(f"Preprocessing page {current_index - 1}")
+
+    def handle_preprocessed_page(self, task_id, result):
+        """Handle a preprocessed page."""
+        if result:
+            page_index = int(task_id.split('_')[1])
+            print(f"Page {page_index} preprocessed successfully")
+
     def handle_text_edit(self):
         """Handle text edit after the delay timer expires."""
         if self.text_edited:
@@ -993,6 +1145,10 @@ class MainWindow(QMainWindow):
         """Start or resume playback without rewind."""
         print("Starting or resuming playback")
         try:
+            # Get the current cursor position
+            cursor_pos = self.text_display.textCursor().position()
+            print(f"Current cursor position: {cursor_pos}")
+
             # If we're using progressive playback
             if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
                 print("Resuming progressive playback")
@@ -1016,9 +1172,19 @@ class MainWindow(QMainWindow):
                 # Start new synthesis if no current playback
                 if not self.current_audio_path:
                     print("No audio path, starting new synthesis")
-                    self.synthesize_speech()
+                    # Start synthesis from the current cursor position
+                    self.synthesize_speech(start_position=cursor_pos)
                 else:
                     print("Using media player for playback")
+
+                    # Set the position based on the cursor position if possible
+                    if self.word_timings and cursor_pos < len(self.word_timings):
+                        # Find the closest word timing to the cursor position
+                        closest_pos = min(self.word_timings.keys(), key=lambda x: abs(x - cursor_pos))
+                        time_ms = int(self.word_timings[closest_pos] * 1000)
+                        print(f"Setting playback position to {time_ms}ms based on cursor at position {cursor_pos}")
+                        self.media_player.setPosition(time_ms)
+
                     # Use the media player for non-progressive playback
                     self.media_player.play()
 
@@ -1156,6 +1322,9 @@ class MainWindow(QMainWindow):
         # Store the full text
         self.full_text = text
 
+        # Store the full text in the virtual text display
+        self.text_display.full_text = text
+
         # Split into pages
         self.pages = []
 
@@ -1191,6 +1360,12 @@ class MainWindow(QMainWindow):
         # Update navigation buttons
         self.update_navigation_buttons()
 
+        # Clear the preprocessed pages set
+        self.preprocessed_pages.clear()
+
+        # Start preprocessing nearby pages
+        self.preprocess_nearby_pages()
+
         return self.pages
 
     def update_page_label(self):
@@ -1214,17 +1389,39 @@ class MainWindow(QMainWindow):
                 self.toggle_playback()
 
             # Save any edits to the current page
-            self.pages[self.current_page_index] = self.text_display.toPlainText()
+            if not self.text_display.isReadOnly():
+                self.pages[self.current_page_index] = self.text_display.toPlainText()
 
             # Go to previous page
             self.current_page_index -= 1
 
-            # Update text display
-            self.text_display.setPlainText(self.pages[self.current_page_index])
+            # Check if this page has been preprocessed
+            task_id = f"page_{self.current_page_index}"
+            preprocessed_result = self.background_processor.get_result(task_id)
+
+            if preprocessed_result:
+                print(f"Using preprocessed content for page {self.current_page_index}")
+                # We have preprocessed content, use it
+                self.current_audio_path = preprocessed_result.get("audio_path")
+                self.word_timings = preprocessed_result.get("word_timings")
+
+            # Update text display with the page content
+            page_text = self.pages[self.current_page_index]
+
+            # Calculate the start position of this page in the full text
+            page_start = 0
+            for i in range(self.current_page_index):
+                page_start += len(self.pages[i])
+
+            # Set the page text with position information
+            self.text_display.set_page_text(page_text, page_start)
 
             # Update page label and navigation buttons
             self.update_page_label()
             self.update_navigation_buttons()
+
+            # Trigger preprocessing of nearby pages
+            self.preprocess_nearby_pages()
 
             # Update status
             self.status_bar.showMessage(f"Showing page {self.current_page_index + 1} of {len(self.pages)}")
@@ -1237,17 +1434,39 @@ class MainWindow(QMainWindow):
                 self.toggle_playback()
 
             # Save any edits to the current page
-            self.pages[self.current_page_index] = self.text_display.toPlainText()
+            if not self.text_display.isReadOnly():
+                self.pages[self.current_page_index] = self.text_display.toPlainText()
 
             # Go to next page
             self.current_page_index += 1
 
-            # Update text display
-            self.text_display.setPlainText(self.pages[self.current_page_index])
+            # Check if this page has been preprocessed
+            task_id = f"page_{self.current_page_index}"
+            preprocessed_result = self.background_processor.get_result(task_id)
+
+            if preprocessed_result:
+                print(f"Using preprocessed content for page {self.current_page_index}")
+                # We have preprocessed content, use it
+                self.current_audio_path = preprocessed_result.get("audio_path")
+                self.word_timings = preprocessed_result.get("word_timings")
+
+            # Update text display with the page content
+            page_text = self.pages[self.current_page_index]
+
+            # Calculate the start position of this page in the full text
+            page_start = 0
+            for i in range(self.current_page_index):
+                page_start += len(self.pages[i])
+
+            # Set the page text with position information
+            self.text_display.set_page_text(page_text, page_start)
 
             # Update page label and navigation buttons
             self.update_page_label()
             self.update_navigation_buttons()
+
+            # Trigger preprocessing of nearby pages
+            self.preprocess_nearby_pages()
 
             # Update status
             self.status_bar.showMessage(f"Showing page {self.current_page_index + 1} of {len(self.pages)}")
