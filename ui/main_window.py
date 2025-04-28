@@ -37,6 +37,7 @@ from core.kokoro_onnx_engine import KokoroOnnxEngine
 from core.state_manager import StateManager
 from ui.dialogs.transcription_dialog import TranscriptionDialog
 from ui.dialogs.settings_dialog import SettingsDialog
+from ui.bookmarks_dialog import BookmarksDialog
 from utils.helpers import (
     validate_file_path, get_supported_audio_extensions,
     get_supported_text_extensions, format_time
@@ -180,6 +181,8 @@ class MainWindow(QMainWindow):
         import_file_icon = QIcon(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'resources', 'icons', 'import_file.svg'))
         settings_icon = QIcon(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'resources', 'icons', 'settings.svg'))
         app_icon = QIcon(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'resources', 'icons', 'app_icon.svg'))
+        add_bookmark_icon = QIcon(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'resources', 'icons', 'add_bookmark.svg'))
+        get_bookmark_icon = QIcon(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'resources', 'icons', 'get_bookmark.svg'))
 
         # Set application icon
         self.setWindowIcon(app_icon)
@@ -196,13 +199,13 @@ class MainWindow(QMainWindow):
         toolbar.addAction(import_file_action)
 
         # Add bookmark actions
-        self.add_bookmark_action = QAction("Add Bookmark", self)
+        self.add_bookmark_action = QAction(add_bookmark_icon, "Add Bookmark", self)
         self.add_bookmark_action.setToolTip("Save current position as bookmark")
         self.add_bookmark_action.triggered.connect(self.add_bookmark)
         toolbar.addAction(self.add_bookmark_action)
 
-        self.goto_bookmark_action = QAction("Go to Bookmark", self)
-        self.goto_bookmark_action.setToolTip("Jump to saved bookmark position")
+        self.goto_bookmark_action = QAction(get_bookmark_icon, "Bookmarks", self)
+        self.goto_bookmark_action.setToolTip("View and manage bookmarks")
         self.goto_bookmark_action.triggered.connect(self.goto_bookmark)
         toolbar.addAction(self.goto_bookmark_action)
 
@@ -484,11 +487,21 @@ class MainWindow(QMainWindow):
 
         # Stop any existing playback
         if self.is_playing:
+            # Stop media player
             self.media_player.stop()
-            self.is_playing = False
 
-        # Stop any existing TTS processes
-        self.tts_engine.stop_requested = True
+            # Stop TTS engine properly
+            self.tts_engine.stop()
+
+            # Update UI state
+            self.is_playing = False
+            self.play_button.setIcon(self.play_icon)
+            self.highlight_timer.stop()
+
+            # Clear any highlighting
+            clear_cursor = QTextCursor(self.text_display.document())
+            clear_cursor.select(QTextCursor.SelectionType.Document)
+            clear_cursor.setCharFormat(QTextCharFormat())
 
         # Wait for any existing threads to finish
         if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
@@ -820,6 +833,15 @@ class MainWindow(QMainWindow):
 
                 self.last_highlighted_index = current_word_index
 
+                # Store the current position in the text for resuming playback
+                if current_word_index >= 0 and current_word_index < len(self.word_timings):
+                    # Get the character position of this word in the text
+                    word_info = self.word_timings[current_word_index]
+                    if "position" in word_info:
+                        self.last_highlighted_position = word_info["position"]
+                        # Also update the last cursor position to match the current highlighted word
+                        self.last_cursor_position = self.last_highlighted_position
+
                 # Get the word to highlight
                 word = current_word["word"]
 
@@ -879,11 +901,20 @@ class MainWindow(QMainWindow):
 
                         # Only scroll if we're in playback mode
                         if self.is_playing:
-                            # Set the cursor to ensure the highlighted word is visible
-                            self.text_display.setTextCursor(highlight_cursor)
+                            # Create a temporary cursor for scrolling only
+                            scroll_cursor = QTextCursor(highlight_cursor)
+
+                            # Save the current cursor position
+                            original_cursor = self.text_display.textCursor()
+
+                            # Set the temporary cursor to ensure the highlighted word is visible
+                            self.text_display.setTextCursor(scroll_cursor)
 
                             # Scroll to make the highlighted word visible
                             self.text_display.ensureCursorVisible()
+
+                            # Restore the original cursor position
+                            self.text_display.setTextCursor(original_cursor)
 
                         found = True
                         break
@@ -1054,6 +1085,11 @@ class MainWindow(QMainWindow):
 
                 # Store the cursor position for potential rewind
                 self.last_cursor_position = self.text_display.textCursor().position()
+
+                # If we have a highlighted position, use that instead of the cursor position
+                if hasattr(self, 'last_highlighted_position') and self.last_highlighted_position > 0:
+                    self.last_cursor_position = self.last_highlighted_position
+                    print(f"Using highlighted position: {self.last_highlighted_position} as cursor position")
 
                 # Store the current playback position
                 if using_progressive:
@@ -1248,31 +1284,72 @@ class MainWindow(QMainWindow):
         # Get current position
         if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
             # For progressive playback, use the TTS engine's current position
-            self.bookmark_position = self.tts_engine.current_position
+            current_position = self.tts_engine.current_position
         else:
             # For media player playback, convert from milliseconds to seconds
-            self.bookmark_position = self.media_player.position() / 1000
+            current_position = self.media_player.position() / 1000
 
         # Get current text cursor position
-        self.bookmark_text_position = self.text_display.textCursor().position()
+        text_position = self.text_display.textCursor().position()
+
+        # Get current page index
+        page_index = self.current_page_index
+
+        # Create bookmark data
+        bookmark_data = {
+            "position": current_position,
+            "text_position": text_position,
+            "file_path": self.current_file_path,
+            "page_index": page_index,
+            "text": self.current_text[:100] + "..." if len(self.current_text) > 100 else self.current_text,
+            "timestamp": time.time(),  # Add timestamp for sorting
+            "title": f"Bookmark at {format_time(current_position)} - Page {page_index + 1}"
+        }
+
+        # Get existing bookmarks
+        bookmarks = self.state_manager.get("bookmarks", [])
+
+        # Add new bookmark
+        bookmarks.append(bookmark_data)
 
         # Save to state manager
-        self.state_manager.set("bookmark", {
-            "position": self.bookmark_position,
-            "text_position": self.bookmark_text_position,
-            "file_path": self.current_file_path,
-            "text": self.current_text[:100] + "..." if len(self.current_text) > 100 else self.current_text
-        })
+        self.state_manager.set("bookmarks", bookmarks)
 
         # Update UI
-        self.status_bar.showMessage(f"Bookmark added at position {format_time(self.bookmark_position)}")
+        self.status_bar.showMessage(f"Bookmark added at position {format_time(current_position)}")
+
+        # Show a confirmation message
+        QMessageBox.information(
+            self,
+            "Bookmark Added",
+            f"Bookmark added at position {format_time(current_position)} on page {page_index + 1}.\n\n"
+            f"You can access your bookmarks by clicking 'Go to Bookmark' in the toolbar."
+        )
 
     def goto_bookmark(self):
-        """Jump to the saved bookmark position."""
-        # Get bookmark from state manager
-        bookmark = self.state_manager.get("bookmark")
+        """Jump to a saved bookmark position."""
+        # Get bookmarks from state manager
+        bookmarks = self.state_manager.get("bookmarks", [])
+
+        if not bookmarks:
+            self.status_bar.showMessage("No bookmarks saved.")
+            QMessageBox.information(self, "No Bookmarks", "You haven't saved any bookmarks yet.")
+            return
+
+        # Show bookmarks dialog
+        dialog = BookmarksDialog(bookmarks, self)
+        dialog.bookmark_selected.connect(self.handle_bookmark_selected)
+        dialog.bookmarks_modified.connect(lambda bookmarks: self.state_manager.set("bookmarks", bookmarks))
+        dialog.exec()
+
+    def handle_bookmark_selected(self, bookmark):
+        """
+        Handle bookmark selection from the dialog.
+
+        Args:
+            bookmark: The selected bookmark data.
+        """
         if not bookmark:
-            self.status_bar.showMessage("No bookmark saved.")
             return
 
         # Check if the current file matches the bookmarked file
@@ -1290,6 +1367,31 @@ class MainWindow(QMainWindow):
                 self.load_file(bookmark.get("file_path"))
             else:
                 return
+
+        # Go to the bookmarked page
+        page_index = bookmark.get("page_index", 0)
+        if page_index != self.current_page_index:
+            # Save any edits to the current page
+            if not self.text_display.isReadOnly():
+                self.pages[self.current_page_index] = self.text_display.toPlainText()
+
+            # Set the current page index
+            self.current_page_index = page_index
+
+            # Update text display with the page content
+            page_text = self.pages[self.current_page_index]
+
+            # Calculate the start position of this page in the full text
+            page_start = 0
+            for i in range(self.current_page_index):
+                page_start += len(self.pages[i])
+
+            # Set the page text with position information
+            self.text_display.set_page_text(page_text, page_start)
+
+            # Update page label and navigation buttons
+            self.update_page_label()
+            self.update_navigation_buttons()
 
         # Set text cursor position
         cursor = self.text_display.textCursor()

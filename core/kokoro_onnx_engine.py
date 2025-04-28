@@ -225,6 +225,9 @@ class KokoroOnnxEngine:
         timings = []
         current_time = 0.0
 
+        # Track position in the original text
+        position = 0
+
         for word in words:
             # Adjust duration based on word length (simple heuristic)
             # Longer words get more time, with some randomness for natural variation
@@ -235,10 +238,12 @@ class KokoroOnnxEngine:
             timings.append({
                 "word": word,
                 "start": current_time,
-                "end": current_time + adjusted_duration
+                "end": current_time + adjusted_duration,
+                "position": position  # Add position information
             })
 
             current_time += adjusted_duration
+            position += len(word) + 1  # +1 for the space
 
         # Normalize to ensure the last word ends at the total duration
         if timings:
@@ -248,6 +253,53 @@ class KokoroOnnxEngine:
                 timing["end"] *= scale_factor
 
         return timings
+
+    def _process_word_timings(self, words, start_time=0.0, text=None):
+        """
+        Process word timings from the TTS engine.
+
+        Args:
+            words: List of words with timing information.
+            start_time: Start time offset.
+            text: The original text for position tracking.
+
+        Returns:
+            List of word timings.
+        """
+        word_timings = []
+
+        # If we have the original text, try to find word positions
+        word_positions = {}
+        if text:
+            # Simple approach to find word positions in the text
+            current_pos = 0
+            for word in text.split():
+                # Find the word in the text starting from current_pos
+                word_pos = text.find(word, current_pos)
+                if word_pos >= 0:
+                    word_positions[word] = word_pos
+                    current_pos = word_pos + len(word)
+
+        for i, word_info in enumerate(words):
+            word = word_info["word"]
+            start = word_info["start"] + start_time
+            end = word_info["end"] + start_time
+
+            timing_info = {
+                "word": word,
+                "start": start,
+                "end": end
+            }
+
+            # Add position information if available
+            if word in word_positions:
+                timing_info["position"] = word_positions[word]
+            elif "position" in word_info:
+                timing_info["position"] = word_info["position"]
+
+            word_timings.append(timing_info)
+
+        return word_timings
 
     def get_word_at_position(self, position: float) -> Dict[str, Union[str, float]]:
         """
@@ -335,6 +387,22 @@ class KokoroOnnxEngine:
         """Stop audio playback."""
         self.stop_requested = True
         sd.stop()
+
+    def stop(self):
+        """Stop playback and reset state."""
+        print("Stopping TTS engine playback")
+        self.stop_requested = True
+        self.pause_requested = False
+        self.current_position = 0.0
+        sd.stop()
+
+        # Clear any queued audio
+        if hasattr(self, 'audio_queue'):
+            try:
+                while not self.audio_queue.empty():
+                    self.audio_queue.get_nowait()
+            except Exception as e:
+                print(f"Error clearing audio queue: {str(e)}")
 
     def toggle_pause(self):
         """Toggle pause state."""
