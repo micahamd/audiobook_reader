@@ -60,6 +60,12 @@ class MainWindow(QMainWindow):
         self.bookmark_position = 0.0
         self.bookmark_text_position = 0
 
+        # Initialize paging system
+        self.full_text = ""  # The complete text of the book
+        self.pages = []  # List of text pages
+        self.current_page_index = 0
+        self.page_size = 5000  # Characters per page (adjustable)
+
         # Initialize media player
         self.media_player = QMediaPlayer()
         self.audio_output = QAudioOutput()
@@ -132,6 +138,25 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.time_label)
 
         main_layout.addLayout(controls_layout)
+
+        # Create page navigation controls
+        page_layout = QHBoxLayout()
+
+        self.prev_page_button = QPushButton("← Previous Page")
+        self.prev_page_button.setToolTip("Go to previous page")
+        self.prev_page_button.clicked.connect(self.go_to_previous_page)
+        page_layout.addWidget(self.prev_page_button)
+
+        self.page_label = QLabel("Page 1 of 1")
+        self.page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        page_layout.addWidget(self.page_label)
+
+        self.next_page_button = QPushButton("Next Page →")
+        self.next_page_button.setToolTip("Go to next page")
+        self.next_page_button.clicked.connect(self.go_to_next_page)
+        page_layout.addWidget(self.next_page_button)
+
+        main_layout.addLayout(page_layout)
 
         # Create toolbar
         toolbar = QToolBar("Main Toolbar")
@@ -355,7 +380,13 @@ class MainWindow(QMainWindow):
             # Update UI
             self.current_file_path = file_path
             self.current_text = content
-            self.text_display.setPlainText(content)
+
+            # Split text into pages
+            self.split_text_into_pages(content)
+
+            # Display the first page
+            if self.pages:
+                self.text_display.setPlainText(self.pages[0])
 
             # Make text editable immediately
             self.text_display.setReadOnly(False)
@@ -373,8 +404,19 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to load file: {str(e)}")
 
     def synthesize_speech(self):
-        """Synthesize speech from the current text."""
-        if not self.current_text:
+        """Synthesize speech from the current page."""
+        if not self.pages or self.current_page_index >= len(self.pages):
+            return
+
+        # Get the current page text
+        current_page_text = self.text_display.toPlainText()
+
+        # Save any edits to the current page
+        self.pages[self.current_page_index] = current_page_text
+
+        # If the page is empty, don't synthesize
+        if not current_page_text.strip():
+            self.status_bar.showMessage("No text to synthesize on this page.")
             return
 
         # Get TTS settings
@@ -408,7 +450,7 @@ class MainWindow(QMainWindow):
         # Show progress
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.status_bar.showMessage("Synthesizing speech... (will start playing automatically)")
+        self.status_bar.showMessage(f"Synthesizing page {self.current_page_index + 1}... (will start playing automatically)")
 
         # Define callback for chunk progress
         def chunk_callback(chunk_index, total_chunks, audio_path, word_timings):
@@ -424,9 +466,9 @@ class MainWindow(QMainWindow):
             # Clear the cache first to avoid any conflicts
             self.tts_engine.clear_all_cache()
 
-            # Start progressive synthesis and playback
+            # Start progressive synthesis and playback for the current page only
             self.synthesis_thread, self.playback_thread = self.tts_engine.synthesize_and_play_progressively(
-                self.current_text,
+                current_page_text,
                 voice=voice,
                 speed=speed,
                 callback=chunk_callback
@@ -498,9 +540,12 @@ class MainWindow(QMainWindow):
             progress_callback.emit(50)
 
             try:
+                # Get the current page text
+                current_page_text = self.text_display.toPlainText()
+
                 # Synthesize using the chunked approach
                 audio_path, word_timings = self.tts_engine.synthesize(
-                    self.current_text,
+                    current_page_text,
                     voice=voice,
                     speed=speed
                 )
@@ -519,8 +564,11 @@ class MainWindow(QMainWindow):
                     "pip install kokoro-onnx"
                 )
 
+                # Get the current page text
+                current_page_text = self.text_display.toPlainText()
+
                 # Use dummy synthesis
-                audio_path, word_timings = self.tts_engine._dummy_synthesize(self.current_text, speed)
+                audio_path, word_timings = self.tts_engine._dummy_synthesize(current_page_text, speed)
 
                 progress_callback.emit(90)
 
@@ -1094,6 +1142,115 @@ class MainWindow(QMainWindow):
 
         # Update UI
         self.status_bar.showMessage("Cache cleared. All audio files removed.")
+
+    def split_text_into_pages(self, text):
+        """
+        Split text into pages of manageable size.
+
+        Args:
+            text: The text to split.
+
+        Returns:
+            List of text pages.
+        """
+        # Store the full text
+        self.full_text = text
+
+        # Split into pages
+        self.pages = []
+
+        # Try to split at paragraph boundaries
+        paragraphs = text.split('\n\n')
+        current_page = ""
+
+        for paragraph in paragraphs:
+            # If adding this paragraph would exceed the page size, start a new page
+            if len(current_page) + len(paragraph) + 2 > self.page_size and current_page:
+                self.pages.append(current_page)
+                current_page = paragraph
+            else:
+                if current_page:
+                    current_page += '\n\n' + paragraph
+                else:
+                    current_page = paragraph
+
+        # Add the last page if it's not empty
+        if current_page:
+            self.pages.append(current_page)
+
+        # If no pages were created, create at least one
+        if not self.pages:
+            self.pages = [text]
+
+        # Reset current page index
+        self.current_page_index = 0
+
+        # Update page label
+        self.update_page_label()
+
+        # Update navigation buttons
+        self.update_navigation_buttons()
+
+        return self.pages
+
+    def update_page_label(self):
+        """Update the page label with current page information."""
+        total_pages = len(self.pages)
+        self.page_label.setText(f"Page {self.current_page_index + 1} of {total_pages}")
+
+    def update_navigation_buttons(self):
+        """Update the state of navigation buttons."""
+        # Enable/disable previous page button
+        self.prev_page_button.setEnabled(self.current_page_index > 0)
+
+        # Enable/disable next page button
+        self.next_page_button.setEnabled(self.current_page_index < len(self.pages) - 1)
+
+    def go_to_previous_page(self):
+        """Go to the previous page."""
+        if self.current_page_index > 0:
+            # Stop any current playback
+            if self.is_playing:
+                self.toggle_playback()
+
+            # Save any edits to the current page
+            self.pages[self.current_page_index] = self.text_display.toPlainText()
+
+            # Go to previous page
+            self.current_page_index -= 1
+
+            # Update text display
+            self.text_display.setPlainText(self.pages[self.current_page_index])
+
+            # Update page label and navigation buttons
+            self.update_page_label()
+            self.update_navigation_buttons()
+
+            # Update status
+            self.status_bar.showMessage(f"Showing page {self.current_page_index + 1} of {len(self.pages)}")
+
+    def go_to_next_page(self):
+        """Go to the next page."""
+        if self.current_page_index < len(self.pages) - 1:
+            # Stop any current playback
+            if self.is_playing:
+                self.toggle_playback()
+
+            # Save any edits to the current page
+            self.pages[self.current_page_index] = self.text_display.toPlainText()
+
+            # Go to next page
+            self.current_page_index += 1
+
+            # Update text display
+            self.text_display.setPlainText(self.pages[self.current_page_index])
+
+            # Update page label and navigation buttons
+            self.update_page_label()
+            self.update_navigation_buttons()
+
+            # Update status
+            self.status_bar.showMessage(f"Showing page {self.current_page_index + 1} of {len(self.pages)}")
 
     def show_settings(self):
         """Show the settings dialog."""
