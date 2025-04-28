@@ -87,6 +87,8 @@ class MainWindow(QMainWindow):
         self.word_timings = []
         self.is_playing = False
         self.auto_play = False  # Don't auto-play when loading files
+        self.last_playback_position = 0  # Track the last playback position
+        self.last_cursor_position = 0  # Track the last cursor position
         self.highlight_timer = QTimer()
         self.highlight_timer.timeout.connect(self.update_highlight)
 
@@ -1052,6 +1054,16 @@ class MainWindow(QMainWindow):
 
                 # Store the cursor position for potential rewind
                 self.last_cursor_position = self.text_display.textCursor().position()
+
+                # Store the current playback position
+                if using_progressive:
+                    # For progressive playback, get position from TTS engine
+                    self.last_playback_position = self.tts_engine.current_position
+                    print(f"Stored progressive playback position: {self.last_playback_position}s")
+                else:
+                    # For media player, get position in milliseconds and convert to seconds
+                    self.last_playback_position = self.media_player.position() / 1000.0
+                    print(f"Stored media player position: {self.last_playback_position}s")
             except Exception as e:
                 print(f"Error pausing playback: {str(e)}")
                 self.status_bar.showMessage(f"Error pausing: {str(e)}")
@@ -1152,6 +1164,19 @@ class MainWindow(QMainWindow):
             # If we're using progressive playback
             if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
                 print("Resuming progressive playback")
+
+                # Check if we have a saved playback position
+                if hasattr(self, 'last_playback_position') and self.last_playback_position > 0:
+                    # Set the position in the TTS engine
+                    print(f"Resuming from saved position: {self.last_playback_position}s")
+                    self.tts_engine.set_position(self.last_playback_position)
+
+                    # Find the chunk containing this position
+                    chunk_index = self.tts_engine.find_chunk_for_position(self.last_playback_position)
+                    if chunk_index >= 0:
+                        print(f"Resuming from chunk {chunk_index}")
+                        self.tts_engine.rewind_to_chunk(chunk_index)
+
                 # Resume the paused playback
                 is_paused = self.tts_engine.toggle_pause()
                 print(f"After toggle, is_paused = {is_paused}")
@@ -1177,8 +1202,14 @@ class MainWindow(QMainWindow):
                 else:
                     print("Using media player for playback")
 
-                    # Set the position based on the cursor position if possible
-                    if self.word_timings and cursor_pos < len(self.word_timings):
+                    # Check if we have a saved playback position
+                    if hasattr(self, 'last_playback_position') and self.last_playback_position > 0:
+                        # Use the saved position
+                        time_ms = int(self.last_playback_position * 1000)
+                        print(f"Resuming from saved position: {self.last_playback_position}s ({time_ms}ms)")
+                        self.media_player.setPosition(time_ms)
+                    # Otherwise, set the position based on the cursor position if possible
+                    elif self.word_timings and cursor_pos < len(self.word_timings):
                         # Find the closest word timing to the cursor position
                         closest_pos = min(self.word_timings.keys(), key=lambda x: abs(x - cursor_pos))
                         time_ms = int(self.word_timings[closest_pos] * 1000)
@@ -1381,12 +1412,20 @@ class MainWindow(QMainWindow):
         # Enable/disable next page button
         self.next_page_button.setEnabled(self.current_page_index < len(self.pages) - 1)
 
+    def reset_playback_position(self):
+        """Reset the saved playback position."""
+        self.last_playback_position = 0
+        print("Playback position reset")
+
     def go_to_previous_page(self):
         """Go to the previous page."""
         if self.current_page_index > 0:
             # Stop any current playback
             if self.is_playing:
                 self.toggle_playback()
+
+            # Reset the playback position when changing pages
+            self.reset_playback_position()
 
             # Save any edits to the current page
             if not self.text_display.isReadOnly():
@@ -1432,6 +1471,9 @@ class MainWindow(QMainWindow):
             # Stop any current playback
             if self.is_playing:
                 self.toggle_playback()
+
+            # Reset the playback position when changing pages
+            self.reset_playback_position()
 
             # Save any edits to the current page
             if not self.text_display.isReadOnly():
