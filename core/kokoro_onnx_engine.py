@@ -649,6 +649,16 @@ class KokoroOnnxEngine:
 
         return self.pause_requested  # Return the new state
 
+    def set_position(self, position: float):
+        """
+        Set the current playback position.
+
+        Args:
+            position: Position in seconds.
+        """
+        print(f"Setting TTS engine position to {position}s")
+        self.current_position = position
+
     def synthesize_and_play_progressively(self, text: str, voice: str = "af_sarah", speed: float = 1.0, callback=None):
         """
         Synthesize speech from text and start playing as soon as the first chunk is ready.

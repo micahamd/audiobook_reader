@@ -298,58 +298,57 @@ class MainWindow(QMainWindow):
         # Set a flag to indicate we're shutting down to prevent callbacks from accessing UI
         self.is_shutting_down = True
 
-        # Stop any ongoing playback
-        if self.is_playing:
-            # Stop media player
-            self.media_player.stop()
-
-            # Stop TTS engine properly
-            self.tts_engine.stop()
-            self.tts_engine.stop_requested = True
-
-            # Update UI state
-            self.is_playing = False
-            self.highlight_timer.stop()
-
-        # Save current playback position before closing
+        # Save current playback position before stopping playback
         self._save_current_position()
 
         # Save application state
         self.save_state()
 
+        # Stop the highlight timer first to prevent UI updates during shutdown
+        self.highlight_timer.stop()
+
+        # Stop any ongoing playback
+        if self.is_playing:
+            # Stop media player
+            self.media_player.stop()
+
+            # Update UI state
+            self.is_playing = False
+
+        # Set the stop flag for the TTS engine
+        self.tts_engine.stop_requested = True
+
+        # Stop the TTS engine in a safer way
+        try:
+            # Stop the TTS engine
+            self.tts_engine.stop()
+
+            # Wait a moment for the stop to take effect
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"Warning: Error stopping TTS engine: {str(e)}")
+
         # Wait for any existing threads to finish
         if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
             try:
                 print("Waiting for synthesis thread to finish...")
-                # Set the stop flag to ensure the thread exits
-                self.tts_engine.stop_requested = True
-                self.synthesis_thread.join(1.0)  # Wait up to 1 second
+                # Don't join the thread as it might be waiting for the executor
+                # Just let it run its course and be terminated when the process exits
+                pass
             except Exception as e:
-                print(f"Warning: Could not join synthesis thread: {str(e)}")
+                print(f"Warning: Error with synthesis thread: {str(e)}")
 
         if hasattr(self, 'playback_thread') and self.playback_thread and self.playback_thread.is_alive():
             try:
                 print("Waiting for playback thread to finish...")
-                # Set the stop flag to ensure the thread exits
-                self.tts_engine.stop_requested = True
-                self.playback_thread.join(1.0)  # Wait up to 1 second
+                # Don't join the thread as it might be waiting for the executor
+                # Just let it run its course and be terminated when the process exits
+                pass
             except Exception as e:
-                print(f"Warning: Could not join playback thread: {str(e)}")
+                print(f"Warning: Error with playback thread: {str(e)}")
 
-        # Unload the TTS model to free resources
-        try:
-            print("Unloading TTS model...")
-            # Make sure all async tasks are properly stopped
-            if hasattr(self.tts_engine, 'stop_all_tasks'):
-                self.tts_engine.stop_all_tasks()
-
-            # Wait a moment for tasks to clean up
-            time.sleep(0.5)
-
-            # Now unload the model
-            self.tts_engine.unload_model()
-        except Exception as e:
-            print(f"Warning: Could not unload TTS model: {str(e)}")
+        # Don't try to unload the model or stop tasks, as this can cause the 'cannot schedule new futures after shutdown' error
+        # Just let the Python process clean up resources when it exits
 
         # Accept the close event
         event.accept()
@@ -586,6 +585,9 @@ class MainWindow(QMainWindow):
                     cursor = self.text_display.textCursor()
                     cursor.setPosition(min(cursor_position, len(self.pages[self.current_page_index])))
                     self.text_display.setTextCursor(cursor)
+                    # Ensure the cursor is visible
+                    self.text_display.ensureCursorVisible()
+                    print(f"Set cursor position to {cursor_position}")
 
             # Make text editable immediately
             self.text_display.setReadOnly(False)
@@ -734,17 +736,35 @@ class MainWindow(QMainWindow):
                     self.handle_first_chunk(audio_path, word_timings)
 
                     # If we have a start position, set it
-                    if start_position is not None and word_timings:
-                        # Find the closest word timing to the start position
-                        try:
-                            closest_pos = min(word_timings.keys(), key=lambda x: abs(x - start_position))
-                            time_sec = word_timings[closest_pos]
-                            print(f"Setting initial playback position to {time_sec}s based on cursor at position {start_position}")
+                    if start_position is not None:
+                        # Store the start position for later use
+                        self.last_cursor_position = start_position
+                        print(f"Stored cursor position: {start_position}")
 
-                            # Set the position in the TTS engine
-                            self.tts_engine.set_position(time_sec)
-                        except Exception as e:
-                            print(f"Error setting initial position: {str(e)}")
+                        # Try to find the corresponding time position if we have word timings
+                        if word_timings:
+                            try:
+                                # Convert keys to integers for comparison
+                                positions = []
+                                for pos_key in word_timings.keys():
+                                    try:
+                                        positions.append(int(float(pos_key)))
+                                    except (ValueError, TypeError):
+                                        pass
+
+                                if positions:
+                                    closest_pos = min(positions, key=lambda x: abs(x - start_position))
+                                    closest_pos_key = str(closest_pos)
+
+                                    if closest_pos_key in word_timings:
+                                        time_sec = float(word_timings[closest_pos_key])
+                                        print(f"Setting initial playback position to {time_sec}s based on cursor at position {start_position}")
+
+                                        # Set the position in the TTS engine
+                                        self.tts_engine.set_position(time_sec)
+                                        self.last_playback_position = time_sec
+                            except Exception as e:
+                                print(f"Error setting initial position: {str(e)}")
             except RuntimeError as e:
                 # The UI is being destroyed, just log and return
                 print(f"UI component error in callback: {str(e)} - UI may be shutting down")
@@ -1017,22 +1037,6 @@ class MainWindow(QMainWindow):
             if not self.is_playing:
                 return
 
-            # Check if we have word timings
-            word_timings_list = None
-
-            # First try to get the list version from the TTS engine
-            if hasattr(self.tts_engine, 'word_timings_list') and self.tts_engine.word_timings_list:
-                word_timings_list = self.tts_engine.word_timings_list
-                print(f"Using word_timings_list from TTS engine with {len(word_timings_list)} entries")
-            # If not available, check if we have a dictionary version
-            elif self.word_timings:
-                print("No word_timings_list available, using dictionary version")
-                # We can't highlight properly with just the dictionary, so return
-                return
-            else:
-                # No word timings available
-                return
-
             # Get current time - either from media player or from TTS engine
             if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
                 # For progressive playback, use the TTS engine's current position
@@ -1041,141 +1045,107 @@ class MainWindow(QMainWindow):
                 # For media player playback, convert from milliseconds to seconds
                 current_time = self.media_player.position() / 1000
 
-            # Find the current word index based on time
-            current_word_index = -1
-            for i, timing in enumerate(word_timings_list):
-                if timing["start"] <= current_time <= timing["end"]:
-                    current_word_index = i
-                    break
+            # Store the current playback position for resuming later
+            self.last_playback_position = current_time
 
-            # If we didn't find an exact match, find the closest word
-            if current_word_index == -1:
-                # Find the word that's about to be spoken
+            # Simplified highlighting approach - highlight the current chunk or sentence
+            # This reduces computational load and potential issues with word-level highlighting
+
+            # Get the current text
+            current_text = self.text_display.toPlainText()
+
+            # Clear previous highlighting
+            clear_cursor = QTextCursor(self.text_display.document())
+            clear_cursor.select(QTextCursor.SelectionType.Document)
+            clear_cursor.setCharFormat(QTextCharFormat())
+
+            # Create a format for highlighting
+            highlight_format = QTextCharFormat()
+            highlight_format.setBackground(QColor(255, 255, 0, 200))  # Brighter yellow
+            highlight_format.setForeground(QColor(0, 0, 0))  # Black text
+
+            # Determine which chunk to highlight based on time
+            # If we have word timings, use them to find the approximate position
+            if hasattr(self.tts_engine, 'word_timings_list') and self.tts_engine.word_timings_list:
+                word_timings_list = self.tts_engine.word_timings_list
+
+                # Find the current word based on time
+                current_word_index = -1
                 for i, timing in enumerate(word_timings_list):
-                    if timing["start"] > current_time:
-                        if i > 0:
-                            current_word_index = i - 1
-                        else:
-                            current_word_index = 0
+                    if timing["start"] <= current_time <= timing["end"]:
+                        current_word_index = i
                         break
 
-            # If we still don't have a word, use the last word
-            if current_word_index == -1 and word_timings_list:
-                current_word_index = len(word_timings_list) - 1
+                # If we didn't find an exact match, find the closest word
+                if current_word_index == -1:
+                    for i, timing in enumerate(word_timings_list):
+                        if timing["start"] > current_time:
+                            if i > 0:
+                                current_word_index = i - 1
+                            else:
+                                current_word_index = 0
+                            break
 
-            # If we have a valid word index, highlight it
-            if current_word_index >= 0 and current_word_index < len(word_timings_list):
-                current_word = word_timings_list[current_word_index]
+                # If we still don't have a word, use the last word
+                if current_word_index == -1 and word_timings_list:
+                    current_word_index = len(word_timings_list) - 1
 
-                # Store the current word index to avoid unnecessary updates
-                if hasattr(self, 'last_highlighted_index') and self.last_highlighted_index == current_word_index:
-                    return  # Skip if we're already highlighting this word
-
-                self.last_highlighted_index = current_word_index
-
-                # Store the current position in the text for resuming playback
+                # If we have a valid word index, get its position
                 if current_word_index >= 0 and current_word_index < len(word_timings_list):
-                    # Get the character position of this word in the text
                     word_info = word_timings_list[current_word_index]
                     if "position" in word_info:
+                        # Store the position for resuming playback
                         self.last_highlighted_position = word_info["position"]
-                        # Also update the last cursor position to match the current highlighted word
                         self.last_cursor_position = self.last_highlighted_position
-                        # Store the current time position
-                        if "start" in word_info:
-                            self.last_playback_position = word_info["start"]
 
-                # Get the word to highlight
-                word = current_word["word"]
+                        # Find the sentence or chunk containing this position
+                        # Simple approach: highlight from the start of the current sentence to the end
+                        sentence_start = max(0, current_text.rfind('.', 0, self.last_highlighted_position) + 1)
+                        sentence_end = current_text.find('.', self.last_highlighted_position)
+                        if sentence_end == -1:
+                            sentence_end = len(current_text)
 
-                # Save the current cursor position and scroll position
-                old_cursor = self.text_display.textCursor()
-                old_scroll_value = self.text_display.verticalScrollBar().value()
+                        # Highlight the sentence
+                        cursor = QTextCursor(self.text_display.document())
+                        cursor.setPosition(sentence_start)
+                        cursor.setPosition(sentence_end, QTextCursor.MoveMode.KeepAnchor)
+                        cursor.setCharFormat(highlight_format)
 
-                # Clear previous highlighting
-                clear_cursor = QTextCursor(self.text_display.document())
-                clear_cursor.select(QTextCursor.SelectionType.Document)
-                clear_cursor.setCharFormat(QTextCharFormat())
+                        # Scroll to make the highlighted text visible
+                        scroll_cursor = QTextCursor(self.text_display.document())
+                        scroll_cursor.setPosition(self.last_highlighted_position)
+                        self.text_display.setTextCursor(scroll_cursor)
+                        self.text_display.ensureCursorVisible()
+            else:
+                # If no word timings, use a simpler approach based on playback progress
+                total_duration = self.media_player.duration() / 1000.0
+                if total_duration > 0:
+                    # Estimate position in text based on playback progress
+                    progress = current_time / total_duration
+                    estimated_position = int(progress * len(current_text))
 
-                # Create a format for highlighting
-                highlight_format = QTextCharFormat()
-                highlight_format.setBackground(QColor(255, 255, 0, 200))  # Brighter yellow
-                highlight_format.setForeground(QColor(0, 0, 0))  # Black text
+                    # Find the sentence containing this position
+                    sentence_start = max(0, current_text.rfind('.', 0, estimated_position) + 1)
+                    sentence_end = current_text.find('.', estimated_position)
+                    if sentence_end == -1:
+                        sentence_end = len(current_text)
 
-                # Calculate approximate position in text
-                # This is more efficient than searching through the entire text
-                words_before = current_word_index
-                approx_char_pos = min(words_before * 6, self.text_display.document().characterCount() - 1)  # Estimate 6 chars per word
+                    # Highlight the sentence
+                    cursor = QTextCursor(self.text_display.document())
+                    cursor.setPosition(sentence_start)
+                    cursor.setPosition(sentence_end, QTextCursor.MoveMode.KeepAnchor)
+                    cursor.setCharFormat(highlight_format)
 
-                # Start searching from the approximate position
-                cursor = QTextCursor(self.text_display.document())
-                cursor.setPosition(max(0, approx_char_pos - 100))  # Start a bit before the estimated position
+                    # Store the position for resuming playback
+                    self.last_highlighted_position = estimated_position
+                    self.last_cursor_position = estimated_position
 
-                # Find and highlight the word
-                found = False
-                search_count = 0
-                max_searches = 200  # Limit searches to avoid performance issues
+                    # Scroll to make the highlighted text visible
+                    scroll_cursor = QTextCursor(self.text_display.document())
+                    scroll_cursor.setPosition(estimated_position)
+                    self.text_display.setTextCursor(scroll_cursor)
+                    self.text_display.ensureCursorVisible()
 
-                while not found and search_count < max_searches:
-                    search_count += 1
-
-                    # Find the next occurrence of the word
-                    search_result = self.text_display.document().find(
-                        word,
-                        cursor,
-                        QTextDocument.FindFlag.FindCaseSensitively
-                    )
-
-                    if search_result.isNull():
-                        # If not found with exact case, try case-insensitive
-                        cursor.setPosition(max(0, approx_char_pos - 100))
-                        search_result = self.text_display.document().find(
-                            word,
-                            cursor,
-                            QTextDocument.FindFlag.FindWholeWords
-                        )
-
-                    if not search_result.isNull():
-                        # Apply highlighting
-                        search_result.setCharFormat(highlight_format)
-
-                        # Create a cursor at the highlighted position for scrolling
-                        highlight_cursor = QTextCursor(search_result)
-
-                        # Only scroll if we're in playback mode
-                        if self.is_playing:
-                            # Create a temporary cursor for scrolling only
-                            scroll_cursor = QTextCursor(highlight_cursor)
-
-                            # Save the current cursor position
-                            original_cursor = self.text_display.textCursor()
-
-                            # Set the temporary cursor to ensure the highlighted word is visible
-                            self.text_display.setTextCursor(scroll_cursor)
-
-                            # Scroll to make the highlighted word visible
-                            self.text_display.ensureCursorVisible()
-
-                            # Restore the original cursor position
-                            self.text_display.setTextCursor(original_cursor)
-
-                        found = True
-                        break
-                    else:
-                        # If not found near the estimated position, try from the beginning
-                        if search_count == 1:
-                            cursor.setPosition(0)
-                        else:
-                            # Move forward and try again
-                            cursor.movePosition(QTextCursor.MoveOperation.NextWord)
-
-                # If we're not in playback mode, restore the original cursor and scroll position
-                if not self.is_playing:
-                    self.text_display.setTextCursor(old_cursor)
-                    self.text_display.verticalScrollBar().setValue(old_scroll_value)
-
-                if not found:
-                    print(f"Warning: Could not find word '{word}' in text to highlight")
         except Exception as e:
             print(f"Error in update_highlight: {str(e)}")
             # Don't let highlighting errors crash the application
@@ -1343,9 +1313,9 @@ class MainWindow(QMainWindow):
                 using_progressive = hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive()
 
                 if using_progressive:
-                    # Toggle pause in the TTS engine for progressive playback
-                    is_paused = self.tts_engine.toggle_pause()
-                    print(f"Progressive playback paused: {is_paused}")
+                    # Directly set pause flag in the TTS engine for progressive playback
+                    self.tts_engine.pause_requested = True
+                    print(f"Progressive playback paused")
                 else:
                     # Pause the media player for non-progressive playback
                     self.media_player.pause()
@@ -1573,8 +1543,44 @@ class MainWindow(QMainWindow):
             if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
                 print("Resuming progressive playback")
 
-                # Check if we have a saved playback position
-                if hasattr(self, 'last_playback_position') and self.last_playback_position > 0:
+                # If cursor was manually moved, use the cursor position
+                if self.cursor_manually_moved or not hasattr(self, 'last_playback_position') or self.last_playback_position == 0:
+                    # Get the current cursor position
+                    cursor_pos = self.text_display.textCursor().position()
+                    print(f"Using cursor position for progressive playback: {cursor_pos}")
+
+                    # Try to find the corresponding time position if we have word timings
+                    if self.word_timings:
+                        try:
+                            # Convert keys to integers for comparison
+                            positions = []
+                            for pos_key in self.word_timings.keys():
+                                try:
+                                    positions.append(int(float(pos_key)))
+                                except (ValueError, TypeError):
+                                    pass
+
+                            if positions:
+                                closest_pos = min(positions, key=lambda x: abs(x - cursor_pos))
+                                closest_pos_key = str(closest_pos)
+
+                                if closest_pos_key in self.word_timings:
+                                    time_sec = float(self.word_timings[closest_pos_key])
+                                    print(f"Setting playback position to {time_sec}s based on cursor at position {cursor_pos}")
+
+                                    # Set the position in the TTS engine
+                                    self.tts_engine.set_position(time_sec)
+                                    self.last_playback_position = time_sec
+
+                                    # Find the chunk containing this position
+                                    chunk_index = self.tts_engine.find_chunk_for_position(time_sec)
+                                    if chunk_index >= 0:
+                                        print(f"Resuming from chunk {chunk_index}")
+                                        self.tts_engine.rewind_to_chunk(chunk_index)
+                        except Exception as e:
+                            print(f"Error setting position from cursor: {str(e)}")
+                # Otherwise, check if we have a saved playback position
+                elif hasattr(self, 'last_playback_position') and self.last_playback_position > 0:
                     # Set the position in the TTS engine
                     print(f"Resuming from saved position: {self.last_playback_position}s")
                     self.tts_engine.set_position(self.last_playback_position)
@@ -1586,14 +1592,8 @@ class MainWindow(QMainWindow):
                         self.tts_engine.rewind_to_chunk(chunk_index)
 
                 # Resume the paused playback
-                is_paused = self.tts_engine.toggle_pause()
-                print(f"After toggle, is_paused = {is_paused}")
-
-                # If toggle_pause returned True, it means it's now paused (which is not what we want)
-                if is_paused:
-                    print("Toggle resulted in paused state, toggling again")
-                    is_paused = self.tts_engine.toggle_pause()
-                    print(f"After second toggle, is_paused = {is_paused}")
+                self.tts_engine.pause_requested = False  # Directly set to False to ensure it's not paused
+                print(f"Set pause_requested to False")
 
                 # Update UI
                 self.play_button.setIcon(self.pause_icon)
