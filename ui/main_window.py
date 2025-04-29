@@ -90,6 +90,7 @@ class MainWindow(QMainWindow):
         self.auto_play = False  # Don't auto-play when loading files
         self.last_playback_position = 0  # Track the last playback position
         self.last_cursor_position = 0  # Track the last cursor position
+        self.cursor_manually_moved = False  # Track if cursor was manually moved
         self.highlight_timer = QTimer()
         self.highlight_timer.timeout.connect(self.update_highlight)
 
@@ -98,6 +99,12 @@ class MainWindow(QMainWindow):
         self.edit_timer.setSingleShot(True)
         self.edit_timer.timeout.connect(self.handle_text_edit)
         self.text_edited = False
+
+        # Flag to track if the application is shutting down
+        self.is_shutting_down = False
+
+        # Variable to store the last playback position
+        self.last_playback_position = 0
 
         # Set up the UI
         self.setup_ui()
@@ -121,6 +128,7 @@ class MainWindow(QMainWindow):
         self.text_display.setFont(QFont("Arial", 12))
         self.text_display.text_edited.connect(self.on_text_changed)
         self.text_display.content_changed.connect(self.on_content_changed)
+        self.text_display.cursorPositionChanged.connect(self.on_cursor_position_changed)
         main_layout.addWidget(self.text_display)
 
         # Create playback controls
@@ -268,8 +276,17 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close event."""
+        # Save current playback position before closing
+        self._save_current_position()
+
         # Save application state
         self.save_state()
+
+        # Set a flag to indicate we're shutting down to prevent callbacks from accessing UI
+        self.is_shutting_down = True
+
+        # Reset the cursor_manually_moved flag to ensure it doesn't persist between sessions
+        self.cursor_manually_moved = False
 
         # Stop any ongoing playback
         if self.is_playing:
@@ -278,6 +295,7 @@ class MainWindow(QMainWindow):
 
             # Stop TTS engine properly
             self.tts_engine.stop()
+            self.tts_engine.stop_requested = True
 
             # Update UI state
             self.is_playing = False
@@ -287,6 +305,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
             try:
                 print("Waiting for synthesis thread to finish...")
+                # Set the stop flag to ensure the thread exits
+                self.tts_engine.stop_requested = True
                 self.synthesis_thread.join(1.0)  # Wait up to 1 second
             except Exception as e:
                 print(f"Warning: Could not join synthesis thread: {str(e)}")
@@ -294,6 +314,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'playback_thread') and self.playback_thread and self.playback_thread.is_alive():
             try:
                 print("Waiting for playback thread to finish...")
+                # Set the stop flag to ensure the thread exits
+                self.tts_engine.stop_requested = True
                 self.playback_thread.join(1.0)  # Wait up to 1 second
             except Exception as e:
                 print(f"Warning: Could not join playback thread: {str(e)}")
@@ -307,6 +329,37 @@ class MainWindow(QMainWindow):
 
         # Accept the close event
         event.accept()
+
+    def _save_current_position(self):
+        """Save the current playback position for the current file."""
+        if not self.current_file_path:
+            return
+
+        # Get current position
+        current_position = 0
+        if self.is_playing:
+            if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
+                # For progressive playback, use the TTS engine's current position
+                current_position = self.tts_engine.current_position
+            else:
+                # For media player, get position in milliseconds and convert to seconds
+                current_position = self.media_player.position() / 1000.0
+        elif hasattr(self, 'last_playback_position'):
+            # Use the stored position if we have one
+            current_position = self.last_playback_position
+
+        # Get current page
+        current_page = self.current_page_index
+
+        # Save position information
+        file_positions = self.state_manager.get("file_positions", {})
+        file_positions[self.current_file_path] = {
+            "position": current_position,
+            "page": current_page,
+            "cursor_position": self.text_display.textCursor().position()
+        }
+        self.state_manager.set("file_positions", file_positions)
+        print(f"Saved position for {self.current_file_path}: {current_position}s, page {current_page}")
 
     def import_audio(self):
         """Import an audio file."""
@@ -347,7 +400,7 @@ class MainWindow(QMainWindow):
             self.progress_bar.setVisible(True)
 
             # Load the audio file
-            audio, format_str = self.audio_processor.load_audio(file_path)
+            _, _ = self.audio_processor.load_audio(file_path)  # We don't need these values here
 
             # Ask if the user wants to transcribe
             dialog = TranscriptionDialog(self)
@@ -438,7 +491,7 @@ class MainWindow(QMainWindow):
 
             # Load the file - this will automatically use the markdown version if it exists
             # or create a new markdown version if it doesn't
-            content, format_str = self.text_processor.load_file(file_path)
+            content, _ = self.text_processor.load_file(file_path)  # We only need the content
             self.status_bar.showMessage(f"Loaded file: {os.path.basename(file_path)}")
 
             # Update UI
@@ -448,18 +501,56 @@ class MainWindow(QMainWindow):
             # Split text into pages
             self.split_text_into_pages(content)
 
-            # Display the first page
+            # Check if we have a saved position for this file
+            file_positions = self.state_manager.get("file_positions", {})
+            saved_position = file_positions.get(file_path, {})
+
+            if saved_position:
+                # Restore the saved page
+                saved_page = saved_position.get("page", 0)
+                if 0 <= saved_page < len(self.pages):
+                    self.current_page_index = saved_page
+                    print(f"Restoring to saved page {saved_page}")
+
+                # Get the saved position
+                position_seconds = saved_position.get("position", 0)
+                if position_seconds > 0:
+                    self.last_playback_position = position_seconds
+                    print(f"Restoring playback position to {position_seconds}s")
+
+                # Get the saved cursor position
+                cursor_position = saved_position.get("cursor_position", 0)
+            else:
+                # No saved position, start from the beginning
+                self.current_page_index = 0
+                self.last_playback_position = 0
+                cursor_position = 0
+
+            # Display the current page
             if self.pages:
-                self.text_display.setPlainText(self.pages[0])
+                self.text_display.setPlainText(self.pages[self.current_page_index])
+
+                # Update page label
+                self.page_label.setText(f"Page {self.current_page_index + 1} of {len(self.pages)}")
+
+                # Set cursor position if we have one
+                if cursor_position > 0:
+                    cursor = self.text_display.textCursor()
+                    cursor.setPosition(min(cursor_position, len(self.pages[self.current_page_index])))
+                    self.text_display.setTextCursor(cursor)
 
             # Make text editable immediately
             self.text_display.setReadOnly(False)
             self.status_bar.showMessage("Text is editable. Edit as needed, then press Play to synthesize.")
 
+            # Reset the cursor_manually_moved flag when loading a file
+            self.cursor_manually_moved = False
+
             # Prepare speech synthesis but don't auto-play
             if self.auto_play:
                 # Only auto-play if explicitly enabled
-                self.synthesize_speech()
+                # Pass the saved position to start from where we left off
+                self.synthesize_speech(start_position=cursor_position if cursor_position > 0 else None)
             else:
                 # Just prepare the text without playing
                 self.text_edited = True
@@ -578,26 +669,38 @@ class MainWindow(QMainWindow):
 
         # Define callback for chunk progress
         def chunk_callback(chunk_index, total_chunks, audio_path, word_timings):
-            # Update progress
-            progress = int((chunk_index + 1) / total_chunks * 100)
-            self.progress_bar.setValue(progress)
+            # Check if the UI is still valid (not being destroyed)
+            try:
+                # Update progress - wrap in try/except to handle case where UI is being destroyed
+                try:
+                    if self.progress_bar and self.progress_bar.isVisible():
+                        progress = int((chunk_index + 1) / total_chunks * 100)
+                        self.progress_bar.setValue(progress)
+                except RuntimeError:
+                    # UI component has been deleted, we're probably shutting down
+                    print("Progress bar no longer available - UI may be shutting down")
+                    return
 
-            # If this is the first chunk, start playback
-            if chunk_index == 0:
-                self.handle_first_chunk(audio_path, word_timings)
+                # If this is the first chunk, start playback
+                if chunk_index == 0:
+                    self.handle_first_chunk(audio_path, word_timings)
 
-                # If we have a start position, set it
-                if start_position is not None and word_timings:
-                    # Find the closest word timing to the start position
-                    try:
-                        closest_pos = min(word_timings.keys(), key=lambda x: abs(x - start_position))
-                        time_sec = word_timings[closest_pos]
-                        print(f"Setting initial playback position to {time_sec}s based on cursor at position {start_position}")
+                    # If we have a start position, set it
+                    if start_position is not None and word_timings:
+                        # Find the closest word timing to the start position
+                        try:
+                            closest_pos = min(word_timings.keys(), key=lambda x: abs(x - start_position))
+                            time_sec = word_timings[closest_pos]
+                            print(f"Setting initial playback position to {time_sec}s based on cursor at position {start_position}")
 
-                        # Set the position in the TTS engine
-                        self.tts_engine.set_position(time_sec)
-                    except Exception as e:
-                        print(f"Error setting initial position: {str(e)}")
+                            # Set the position in the TTS engine
+                            self.tts_engine.set_position(time_sec)
+                        except Exception as e:
+                            print(f"Error setting initial position: {str(e)}")
+            except RuntimeError as e:
+                # The UI is being destroyed, just log and return
+                print(f"UI component error in callback: {str(e)} - UI may be shutting down")
+                return
 
         try:
             # Clear the cache first to avoid any conflicts
@@ -1042,6 +1145,16 @@ class MainWindow(QMainWindow):
         # We can use this to trigger background processing of nearby pages
         self.preprocess_nearby_pages()
 
+    def on_cursor_position_changed(self):
+        """Handle cursor position changes in the text display."""
+        # Only track cursor movements when not playing
+        if not self.is_playing:
+            # Mark that the cursor was manually moved
+            self.cursor_manually_moved = True
+            # Store the new cursor position
+            self.last_cursor_position = self.text_display.textCursor().position()
+            print(f"Cursor manually moved to position: {self.last_cursor_position}")
+
     def preprocess_nearby_pages(self):
         """Preprocess nearby pages in the background."""
         if not self.pages:
@@ -1197,6 +1310,9 @@ class MainWindow(QMainWindow):
                     self.last_cursor_position = self.last_highlighted_position
                     print(f"Using highlighted position: {self.last_highlighted_position} as cursor position")
 
+                # Reset the cursor_manually_moved flag when pausing
+                self.cursor_manually_moved = False
+
                 # Store the current playback position
                 if using_progressive:
                     # For progressive playback, get position from TTS engine
@@ -1264,7 +1380,7 @@ class MainWindow(QMainWindow):
                             closest_word = None
                             closest_distance = float('inf')
 
-                            for i, timing in enumerate(self.tts_engine.word_timings_list):
+                            for timing in self.tts_engine.word_timings_list:
                                 if "position" in timing:
                                     distance = abs(timing["position"] - current_cursor_position)
                                     if distance < closest_distance:
@@ -1373,6 +1489,21 @@ class MainWindow(QMainWindow):
             cursor_pos = self.text_display.textCursor().position()
             print(f"Current cursor position: {cursor_pos}")
 
+            # Check if cursor was manually moved
+            if self.cursor_manually_moved:
+                print("Cursor was manually moved, prioritizing cursor position over saved position")
+                # Reset the last playback position to force using the cursor position
+                self.last_playback_position = 0
+                # Reset the flag
+                self.cursor_manually_moved = False
+            # If cursor wasn't manually moved, check if we have a saved position
+            elif self.current_file_path and not hasattr(self, 'last_playback_position'):
+                file_positions = self.state_manager.get("file_positions", {})
+                saved_position = file_positions.get(self.current_file_path, {})
+                if saved_position and "position" in saved_position:
+                    self.last_playback_position = saved_position["position"]
+                    print(f"Loaded saved position from state: {self.last_playback_position}s")
+
             # If we're using progressive playback
             if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
                 print("Resuming progressive playback")
@@ -1409,8 +1540,51 @@ class MainWindow(QMainWindow):
                 # Start new synthesis if no current playback
                 if not self.current_audio_path:
                     print("No audio path, starting new synthesis")
-                    # Start synthesis from the current cursor position
-                    self.synthesize_speech(start_position=cursor_pos)
+                    # Start synthesis from the current cursor position or saved position
+                    start_pos = cursor_pos
+                    if hasattr(self, 'last_playback_position') and self.last_playback_position > 0:
+                        # If we have a saved position, use that instead
+                        print(f"Using saved position for synthesis: {self.last_playback_position}s")
+                        # Find the cursor position corresponding to this time
+                        if self.word_timings:
+                            # Check if word_timings is a dictionary or a list
+                            if isinstance(self.word_timings, dict):
+                                print(f"Word timings is a dictionary with {len(self.word_timings)} entries")
+                                # Try to find the position closest to the saved time
+                                closest_time = None
+                                closest_pos = None
+                                for pos, time in self.word_timings.items():
+                                    try:
+                                        time_val = float(time)
+                                        if closest_time is None or abs(time_val - self.last_playback_position) < abs(closest_time - self.last_playback_position):
+                                            closest_time = time_val
+                                            closest_pos = int(float(pos))
+                                    except (ValueError, TypeError):
+                                        continue
+
+                                if closest_pos is not None:
+                                    start_pos = closest_pos
+                                    print(f"Found cursor position {start_pos} for time {closest_time}s")
+                            elif isinstance(self.word_timings, list):
+                                print(f"Word timings is a list with {len(self.word_timings)} entries")
+                                # Handle list-type word timings
+                                closest_time = None
+                                closest_pos = None
+                                for item in self.word_timings:
+                                    if isinstance(item, dict) and "start" in item and "position" in item:
+                                        time_val = item["start"]
+                                        pos = item["position"]
+                                        if closest_time is None or abs(time_val - self.last_playback_position) < abs(closest_time - self.last_playback_position):
+                                            closest_time = time_val
+                                            closest_pos = pos
+
+                                if closest_pos is not None:
+                                    start_pos = closest_pos
+                                    print(f"Found cursor position {start_pos} for time {closest_time}s")
+                            else:
+                                print(f"Word timings is of unsupported type: {type(self.word_timings)}")
+
+                    self.synthesize_speech(start_position=start_pos)
                 else:
                     print("Using media player for playback")
 
@@ -1424,42 +1598,84 @@ class MainWindow(QMainWindow):
                     elif self.word_timings and cursor_pos > 0:
                         try:
                             # Find the closest word timing to the cursor position
-                            # self.word_timings is now a dictionary mapping positions to times
                             print(f"Looking for closest position to cursor position {cursor_pos} in word_timings with {len(self.word_timings)} entries")
 
-                            # Get all positions as integers, ensuring they're valid
-                            try:
-                                positions = [int(float(pos)) for pos in self.word_timings.keys() if str(pos).strip()]
-                                print(f"Found {len(positions)} valid positions in word_timings")
+                            # Check if word_timings is a dictionary or a list
+                            positions = []
+                            if isinstance(self.word_timings, dict):
+                                # Get all positions as integers, ensuring they're valid
+                                try:
+                                    positions = [int(float(pos)) for pos in self.word_timings.keys() if str(pos).strip()]
+                                    print(f"Found {len(positions)} valid positions in word_timings dictionary")
 
-                                # Print some sample positions for debugging
-                                if positions:
-                                    sample_positions = positions[:5] if len(positions) > 5 else positions
-                                    print(f"Sample positions: {sample_positions}")
-                            except Exception as e:
-                                print(f"Error converting positions to integers: {str(e)}")
+                                    # Print some sample positions for debugging
+                                    if positions:
+                                        sample_positions = positions[:5] if len(positions) > 5 else positions
+                                        print(f"Sample positions: {sample_positions}")
+                                except Exception as e:
+                                    print(f"Error converting positions to integers: {str(e)}")
+                                    positions = []
+                            elif isinstance(self.word_timings, list):
+                                # Handle list-type word timings
+                                try:
+                                    positions = []
+                                    for item in self.word_timings:
+                                        if isinstance(item, dict) and "position" in item:
+                                            positions.append(item["position"])
+
+                                    print(f"Found {len(positions)} valid positions in word_timings list")
+
+                                    # Print some sample positions for debugging
+                                    if positions:
+                                        sample_positions = positions[:5] if len(positions) > 5 else positions
+                                        print(f"Sample positions: {sample_positions}")
+                                except Exception as e:
+                                    print(f"Error extracting positions from list: {str(e)}")
+                                    positions = []
+                            else:
+                                print(f"Word timings is of unsupported type: {type(self.word_timings)}")
                                 positions = []
 
                             # Find the closest position
                             if positions:
                                 closest_pos = min(positions, key=lambda x: abs(x - cursor_pos))
-                                # Convert to string to look up in the dictionary
-                                closest_pos_key = str(closest_pos)
-                                if closest_pos_key in self.word_timings:
-                                    time_ms = int(float(self.word_timings[closest_pos_key]) * 1000)
-                                    print(f"Setting playback position to {time_ms}ms based on cursor at position {cursor_pos} (closest position: {closest_pos})")
-                                    self.media_player.setPosition(time_ms)
-                                else:
-                                    # Try with float key
-                                    closest_pos_key = float(closest_pos)
+                                time_ms = 0
+
+                                # Handle different types of word_timings
+                                if isinstance(self.word_timings, dict):
+                                    # Convert to string to look up in the dictionary
+                                    closest_pos_key = str(closest_pos)
                                     if closest_pos_key in self.word_timings:
                                         time_ms = int(float(self.word_timings[closest_pos_key]) * 1000)
                                         print(f"Setting playback position to {time_ms}ms based on cursor at position {cursor_pos} (closest position: {closest_pos})")
-                                        self.media_player.setPosition(time_ms)
                                     else:
-                                        print(f"Closest position {closest_pos} not found in word_timings")
-                                        # Start from the beginning
-                                        self.media_player.setPosition(0)
+                                        # Try with float key
+                                        closest_pos_key = float(closest_pos)
+                                        if closest_pos_key in self.word_timings:
+                                            time_ms = int(float(self.word_timings[closest_pos_key]) * 1000)
+                                            print(f"Setting playback position to {time_ms}ms based on cursor at position {cursor_pos} (closest position: {closest_pos})")
+                                        else:
+                                            print(f"Closest position {closest_pos} not found in word_timings dictionary")
+                                            # Start from the beginning
+                                            time_ms = 0
+                                elif isinstance(self.word_timings, list):
+                                    # Find the item with the matching position
+                                    for item in self.word_timings:
+                                        if isinstance(item, dict) and "position" in item and item["position"] == closest_pos:
+                                            if "start" in item:
+                                                time_ms = int(float(item["start"]) * 1000)
+                                                print(f"Setting playback position to {time_ms}ms based on cursor at position {cursor_pos} (closest position: {closest_pos})")
+                                                break
+
+                                    if time_ms == 0:
+                                        print(f"Closest position {closest_pos} not found in word_timings list")
+
+                                # Set the position
+                                if time_ms > 0:
+                                    self.media_player.setPosition(time_ms)
+                                else:
+                                    # Start from the beginning
+                                    self.media_player.setPosition(0)
                             else:
                                 print("No valid positions available in word_timings")
                                 # Start from the beginning

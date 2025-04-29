@@ -137,44 +137,82 @@ class KokoroOnnxEngine:
                 all_timings = []
 
                 # Create an event loop for async operations
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-
-                # Define the async function to process the stream
-                sample_rate_container = [self.SAMPLE_RATE]  # Use a container to store the sample rate
-
-                async def process_stream():
-                    try:
-                        stream = self.kokoro.create_stream(
-                            text, voice=voice, speed=speed, lang="en-us"
-                        )
-
-                        async for result in stream:
-                            # Handle both 2-value and 3-value tuples
-                            if len(result) == 3:
-                                samples, sr, timings = result
-                            elif len(result) == 2:
-                                samples, sr = result
-                                timings = []
-                            else:
-                                print(f"Unexpected result format: {result}")
-                                continue
-
-                            all_samples.append(samples)
-                            # Store the sample rate for later use
-                            sample_rate_container[0] = sr
-                            if timings:
-                                all_timings.extend(timings)
-                    except Exception as e:
-                        print(f"Error in process_stream: {str(e)}")
-                        raise
-
+                loop = None
                 try:
+                    # Try to get the current event loop
+                    try:
+                        loop = asyncio.get_running_loop()
+                        print("Using existing event loop")
+                    except RuntimeError:
+                        # No running event loop, create a new one
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        print("Created new event loop")
+
+                    # Define the async function to process the stream
+                    sample_rate_container = [self.SAMPLE_RATE]  # Use a container to store the sample rate
+
+                    async def process_stream():
+                        try:
+                            stream = self.kokoro.create_stream(
+                                text, voice=voice, speed=speed, lang="en-us"
+                            )
+
+                            async for result in stream:
+                                # Check if we're being shut down
+                                if self.stop_requested:
+                                    print("Stop requested during stream processing")
+                                    break
+
+                                # Handle both 2-value and 3-value tuples
+                                if len(result) == 3:
+                                    samples, sr, timings = result
+                                elif len(result) == 2:
+                                    samples, sr = result
+                                    timings = []
+                                else:
+                                    print(f"Unexpected result format: {result}")
+                                    continue
+
+                                all_samples.append(samples)
+                                # Store the sample rate for later use
+                                sample_rate_container[0] = sr
+                                if timings:
+                                    all_timings.extend(timings)
+                        except asyncio.CancelledError:
+                            print("Stream processing was cancelled")
+                            raise
+                        except Exception as e:
+                            print(f"Error in process_stream: {str(e)}")
+                            raise
+
                     # Run the async function
-                    loop.run_until_complete(process_stream())
+                    if loop.is_running():
+                        # If the loop is already running, create a task
+                        print("Loop is already running, creating task")
+                        task = asyncio.create_task(process_stream())
+                        # Wait for the task to complete
+                        while not task.done():
+                            time.sleep(0.1)
+                            if self.stop_requested:
+                                print("Stop requested, cancelling task")
+                                task.cancel()
+                                break
+                    else:
+                        # Otherwise, run until complete
+                        print("Running process_stream in event loop")
+                        loop.run_until_complete(process_stream())
+                except Exception as e:
+                    print(f"Error in event loop handling: {str(e)}")
+                    raise
                 finally:
-                    # Always close the loop properly
-                    loop.close()
+                    # Only close the loop if we created it
+                    if loop and not loop.is_running():
+                        try:
+                            loop.close()
+                            print("Closed event loop")
+                        except Exception as e:
+                            print(f"Error closing event loop: {str(e)}")
 
                 # Combine all samples
                 if all_samples:
@@ -719,44 +757,82 @@ class KokoroOnnxEngine:
                     all_timings = []
 
                     # Create an event loop for async operations
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-
-                    # Define the async function to process the stream
-                    sample_rate_container = [self.SAMPLE_RATE]  # Use a container to store the sample rate
-
-                    async def process_stream():
-                        try:
-                            stream = self.kokoro.create_stream(
-                                chunk, voice=voice, speed=speed, lang="en-us"
-                            )
-
-                            async for result in stream:
-                                # Handle both 2-value and 3-value tuples
-                                if len(result) == 3:
-                                    samples, sr, timings = result
-                                elif len(result) == 2:
-                                    samples, sr = result
-                                    timings = []
-                                else:
-                                    print(f"Unexpected result format: {result}")
-                                    continue
-
-                                all_samples.append(samples)
-                                # Store the sample rate for later use
-                                sample_rate_container[0] = sr
-                                if timings:
-                                    all_timings.extend(timings)
-                        except Exception as e:
-                            print(f"Error in process_stream for chunk {i+1}: {str(e)}")
-                            raise
-
+                    loop = None
                     try:
+                        # Try to get the current event loop
+                        try:
+                            loop = asyncio.get_running_loop()
+                            print(f"Using existing event loop for chunk {i+1}")
+                        except RuntimeError:
+                            # No running event loop, create a new one
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            print(f"Created new event loop for chunk {i+1}")
+
+                        # Define the async function to process the stream
+                        sample_rate_container = [self.SAMPLE_RATE]  # Use a container to store the sample rate
+
+                        async def process_stream():
+                            try:
+                                stream = self.kokoro.create_stream(
+                                    chunk, voice=voice, speed=speed, lang="en-us"
+                                )
+
+                                async for result in stream:
+                                    # Check if we're being shut down
+                                    if self.stop_requested:
+                                        print(f"Stop requested during stream processing for chunk {i+1}")
+                                        break
+
+                                    # Handle both 2-value and 3-value tuples
+                                    if len(result) == 3:
+                                        samples, sr, timings = result
+                                    elif len(result) == 2:
+                                        samples, sr = result
+                                        timings = []
+                                    else:
+                                        print(f"Unexpected result format: {result}")
+                                        continue
+
+                                    all_samples.append(samples)
+                                    # Store the sample rate for later use
+                                    sample_rate_container[0] = sr
+                                    if timings:
+                                        all_timings.extend(timings)
+                            except asyncio.CancelledError:
+                                print(f"Stream processing was cancelled for chunk {i+1}")
+                                raise
+                            except Exception as e:
+                                print(f"Error in process_stream for chunk {i+1}: {str(e)}")
+                                raise
+
                         # Run the async function
-                        loop.run_until_complete(process_stream())
+                        if loop.is_running():
+                            # If the loop is already running, create a task
+                            print(f"Loop is already running for chunk {i+1}, creating task")
+                            task = asyncio.create_task(process_stream())
+                            # Wait for the task to complete
+                            while not task.done():
+                                time.sleep(0.1)
+                                if self.stop_requested:
+                                    print(f"Stop requested, cancelling task for chunk {i+1}")
+                                    task.cancel()
+                                    break
+                        else:
+                            # Otherwise, run until complete
+                            print(f"Running process_stream in event loop for chunk {i+1}")
+                            loop.run_until_complete(process_stream())
+                    except Exception as e:
+                        print(f"Error in event loop handling for chunk {i+1}: {str(e)}")
+                        raise
                     finally:
-                        # Always close the loop properly
-                        loop.close()
+                        # Only close the loop if we created it
+                        if loop and not loop.is_running():
+                            try:
+                                loop.close()
+                                print(f"Closed event loop for chunk {i+1}")
+                            except Exception as e:
+                                print(f"Error closing event loop for chunk {i+1}: {str(e)}")
 
                     # Combine all samples
                     if all_samples:
@@ -1097,16 +1173,31 @@ class KokoroOnnxEngine:
 
         # Cancel any pending asyncio tasks
         try:
-            # Get the current event loop
-            loop = asyncio.get_event_loop()
+            # Try to get the current event loop safely
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # No running event loop, create a new one
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
 
             # Cancel all pending tasks
-            for task in asyncio.all_tasks(loop):
-                if not task.done():
-                    print(f"Cancelling task: {task.get_name()}")
-                    task.cancel()
+            try:
+                for task in asyncio.all_tasks(loop):
+                    if not task.done():
+                        print(f"Cancelling task: {task.get_name()}")
+                        task.cancel()
+            except RuntimeError as e:
+                print(f"Error getting tasks: {str(e)}")
+
+            # Close the loop if we created it
+            if loop.is_running():
+                print("Event loop is running, not closing it")
+            else:
+                print("Closing event loop")
+                loop.close()
         except Exception as e:
-            print(f"Error cancelling asyncio tasks: {str(e)}")
+            print(f"Error handling asyncio tasks: {str(e)}")
 
         # Finally, unload the model
         self.kokoro = None
