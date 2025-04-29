@@ -144,20 +144,37 @@ class KokoroOnnxEngine:
                 sample_rate_container = [self.SAMPLE_RATE]  # Use a container to store the sample rate
 
                 async def process_stream():
-                    stream = self.kokoro.create_stream(
-                        text, voice=voice, speed=speed, lang="en-us"
-                    )
+                    try:
+                        stream = self.kokoro.create_stream(
+                            text, voice=voice, speed=speed, lang="en-us"
+                        )
 
-                    async for samples, sr, timings in stream:
-                        all_samples.append(samples)
-                        # Store the sample rate for later use
-                        sample_rate_container[0] = sr
-                        if timings:
-                            all_timings.extend(timings)
+                        async for result in stream:
+                            # Handle both 2-value and 3-value tuples
+                            if len(result) == 3:
+                                samples, sr, timings = result
+                            elif len(result) == 2:
+                                samples, sr = result
+                                timings = []
+                            else:
+                                print(f"Unexpected result format: {result}")
+                                continue
 
-                # Run the async function
-                loop.run_until_complete(process_stream())
-                loop.close()
+                            all_samples.append(samples)
+                            # Store the sample rate for later use
+                            sample_rate_container[0] = sr
+                            if timings:
+                                all_timings.extend(timings)
+                    except Exception as e:
+                        print(f"Error in process_stream: {str(e)}")
+                        raise
+
+                try:
+                    # Run the async function
+                    loop.run_until_complete(process_stream())
+                finally:
+                    # Always close the loop properly
+                    loop.close()
 
                 # Combine all samples
                 if all_samples:
@@ -371,7 +388,7 @@ class KokoroOnnxEngine:
 
         return word_timings
 
-    def _convert_word_timings_to_dict(self, word_timings_list: List[Dict[str, Union[str, float]]]) -> Dict[int, float]:
+    def _convert_word_timings_to_dict(self, word_timings_list: List[Dict[str, Union[str, float]]]) -> Dict[str, float]:
         """
         Convert a list of word timing dictionaries to a position-to-time dictionary.
         This maintains compatibility with code that expects self.word_timings to be a dictionary.
@@ -380,15 +397,16 @@ class KokoroOnnxEngine:
             word_timings_list: List of dictionaries with word timing information.
 
         Returns:
-            Dictionary mapping position (int) to start time (float).
+            Dictionary mapping position (as string) to start time (float).
         """
         position_to_time = {}
 
         for timing in word_timings_list:
             # Only include timings that have position information
             if "position" in timing:
-                position = timing["position"]
-                start_time = timing["start"]
+                # Convert position to string to ensure consistent key type
+                position = str(timing["position"])
+                start_time = float(timing["start"])
                 position_to_time[position] = start_time
 
         # If we don't have any positions, create a simple mapping based on index
@@ -397,7 +415,18 @@ class KokoroOnnxEngine:
             for i, timing in enumerate(word_timings_list):
                 # Estimate position as 6 characters per word
                 estimated_position = i * 6
-                position_to_time[estimated_position] = timing["start"]
+                # Convert to string for consistent key type
+                position_to_time[str(estimated_position)] = float(timing["start"])
+
+        # Print some debug information
+        if position_to_time:
+            print(f"Created word timings dictionary with {len(position_to_time)} entries")
+            # Print a few sample entries
+            sample_keys = list(position_to_time.keys())[:5] if len(position_to_time) > 5 else list(position_to_time.keys())
+            print(f"Sample keys: {sample_keys}")
+            print(f"Key types: {[type(k).__name__ for k in sample_keys]}")
+        else:
+            print("Warning: Empty word timings dictionary created")
 
         return position_to_time
 
@@ -519,22 +548,36 @@ class KokoroOnnxEngine:
             voice: The voice to use.
             speed: The speed factor.
         """
-        stream = self.kokoro.create_stream(
-            text, voice=voice, speed=speed, lang="en-us"
-        )
+        try:
+            stream = self.kokoro.create_stream(
+                text, voice=voice, speed=speed, lang="en-us"
+            )
 
-        # The stream now yields (samples, sr, timings) tuples
-        async for samples, sr, timings in stream:
-            # Print timing information for debugging
-            if timings:
-                print(f"Received timing information: {len(timings)} words")
+            # Handle both 2-value and 3-value tuples
+            async for result in stream:
+                # Handle both 2-value and 3-value tuples
+                if len(result) == 3:
+                    samples, sr, timings = result
+                    # Print timing information for debugging
+                    if timings:
+                        print(f"Received timing information: {len(timings)} words")
+                elif len(result) == 2:
+                    samples, sr = result
+                    timings = []
+                    print("No timing information received (2-value tuple)")
+                else:
+                    print(f"Unexpected result format: {result}")
+                    continue
 
-            while self.pause_requested:
-                await asyncio.sleep(0.1)
-            if self.stop_requested:
-                return
-            sd.play(samples, sr)
-            sd.wait()
+                while self.pause_requested:
+                    await asyncio.sleep(0.1)
+                if self.stop_requested:
+                    return
+                sd.play(samples, sr)
+                sd.wait()
+        except Exception as e:
+            print(f"Error in _play_stream: {str(e)}")
+            # Don't re-raise to avoid crashing the application
 
     def stop_audio(self):
         """Stop audio playback."""
@@ -683,20 +726,37 @@ class KokoroOnnxEngine:
                     sample_rate_container = [self.SAMPLE_RATE]  # Use a container to store the sample rate
 
                     async def process_stream():
-                        stream = self.kokoro.create_stream(
-                            chunk, voice=voice, speed=speed, lang="en-us"
-                        )
+                        try:
+                            stream = self.kokoro.create_stream(
+                                chunk, voice=voice, speed=speed, lang="en-us"
+                            )
 
-                        async for samples, sr, timings in stream:
-                            all_samples.append(samples)
-                            # Store the sample rate for later use
-                            sample_rate_container[0] = sr
-                            if timings:
-                                all_timings.extend(timings)
+                            async for result in stream:
+                                # Handle both 2-value and 3-value tuples
+                                if len(result) == 3:
+                                    samples, sr, timings = result
+                                elif len(result) == 2:
+                                    samples, sr = result
+                                    timings = []
+                                else:
+                                    print(f"Unexpected result format: {result}")
+                                    continue
 
-                    # Run the async function
-                    loop.run_until_complete(process_stream())
-                    loop.close()
+                                all_samples.append(samples)
+                                # Store the sample rate for later use
+                                sample_rate_container[0] = sr
+                                if timings:
+                                    all_timings.extend(timings)
+                        except Exception as e:
+                            print(f"Error in process_stream for chunk {i+1}: {str(e)}")
+                            raise
+
+                    try:
+                        # Run the async function
+                        loop.run_until_complete(process_stream())
+                    finally:
+                        # Always close the loop properly
+                        loop.close()
 
                     # Combine all samples
                     if all_samples:
@@ -1015,5 +1075,39 @@ class KokoroOnnxEngine:
             warnings.warn(f"Error clearing temp directory: {str(e)}")
 
     def unload_model(self):
-        """Unload the model to free memory."""
+        """Unload the model to free memory and clean up resources."""
+        # Stop any ongoing processes
+        self.stop_requested = True
+        self.pause_requested = False
+
+        # Stop any audio playback
+        try:
+            import sounddevice as sd
+            sd.stop()
+        except Exception as e:
+            print(f"Error stopping sounddevice: {str(e)}")
+
+        # Clear any queued audio
+        if hasattr(self, 'audio_queue'):
+            try:
+                while not self.audio_queue.empty():
+                    self.audio_queue.get_nowait()
+            except Exception as e:
+                print(f"Error clearing audio queue: {str(e)}")
+
+        # Cancel any pending asyncio tasks
+        try:
+            # Get the current event loop
+            loop = asyncio.get_event_loop()
+
+            # Cancel all pending tasks
+            for task in asyncio.all_tasks(loop):
+                if not task.done():
+                    print(f"Cancelling task: {task.get_name()}")
+                    task.cancel()
+        except Exception as e:
+            print(f"Error cancelling asyncio tasks: {str(e)}")
+
+        # Finally, unload the model
         self.kokoro = None
+        print("TTS model unloaded successfully")

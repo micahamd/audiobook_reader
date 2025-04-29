@@ -268,7 +268,44 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close event."""
+        # Save application state
         self.save_state()
+
+        # Stop any ongoing playback
+        if self.is_playing:
+            # Stop media player
+            self.media_player.stop()
+
+            # Stop TTS engine properly
+            self.tts_engine.stop()
+
+            # Update UI state
+            self.is_playing = False
+            self.highlight_timer.stop()
+
+        # Wait for any existing threads to finish
+        if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
+            try:
+                print("Waiting for synthesis thread to finish...")
+                self.synthesis_thread.join(1.0)  # Wait up to 1 second
+            except Exception as e:
+                print(f"Warning: Could not join synthesis thread: {str(e)}")
+
+        if hasattr(self, 'playback_thread') and self.playback_thread and self.playback_thread.is_alive():
+            try:
+                print("Waiting for playback thread to finish...")
+                self.playback_thread.join(1.0)  # Wait up to 1 second
+            except Exception as e:
+                print(f"Warning: Could not join playback thread: {str(e)}")
+
+        # Unload the TTS model to free resources
+        try:
+            print("Unloading TTS model...")
+            self.tts_engine.unload_model()
+        except Exception as e:
+            print(f"Warning: Could not unload TTS model: {str(e)}")
+
+        # Accept the close event
         event.accept()
 
     def import_audio(self):
@@ -388,6 +425,8 @@ class MainWindow(QMainWindow):
     def load_file(self, file_path: str):
         """
         Load a text file.
+        The file will be automatically converted to markdown and stored in the markdown directory.
+        Any edits will be saved to the markdown version.
 
         Args:
             file_path: Path to the text file.
@@ -397,8 +436,10 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage(f"Loading file: {os.path.basename(file_path)}")
             self.progress_bar.setVisible(True)
 
-            # Load the file
+            # Load the file - this will automatically use the markdown version if it exists
+            # or create a new markdown version if it doesn't
             content, format_str = self.text_processor.load_file(file_path)
+            self.status_bar.showMessage(f"Loaded file: {os.path.basename(file_path)}")
 
             # Update UI
             self.current_file_path = file_path
@@ -448,6 +489,18 @@ class MainWindow(QMainWindow):
         # Save any edits to the current page
         if not self.text_display.isReadOnly():
             self.pages[self.current_page_index] = current_page_text
+
+            # Save the edited text if we have a current file path
+            if self.current_file_path:
+                try:
+                    # Rebuild the full text
+                    self.current_text = '\n\n'.join(self.pages)
+
+                    # Save directly to the markdown file
+                    markdown_path = self.text_processor.save_markdown(self.current_text, self.current_file_path)
+                    print(f"Saved edited content to {markdown_path} when synthesizing speech")
+                except Exception as e:
+                    print(f"Error saving edited file when synthesizing speech: {str(e)}")
 
         # If the page is empty, don't synthesize
         if not current_page_text.strip():
@@ -1075,9 +1128,26 @@ class MainWindow(QMainWindow):
 
             # Only re-synthesize if the text has actually changed
             if new_text != self.current_text:
-                self.current_text = new_text
+                # Update the current page
+                self.pages[self.current_page_index] = new_text
+
+                # Rebuild the full text
+                self.current_text = '\n\n'.join(self.pages)
+
                 print("Text content changed. Will re-synthesize on play.")
-                self.status_bar.showMessage("Text edited. Will re-synthesize on play.")
+
+                # Save the edited text if we have a current file path
+                if self.current_file_path:
+                    try:
+                        # Save directly to the markdown file
+                        markdown_path = self.text_processor.save_markdown(self.current_text, self.current_file_path)
+                        print(f"Saved edited content to {markdown_path}")
+                        self.status_bar.showMessage("Text edited and saved. Will re-synthesize on play.")
+                    except Exception as e:
+                        print(f"Error saving edited file: {str(e)}")
+                        self.status_bar.showMessage("Text edited. Will re-synthesize on play.")
+                else:
+                    self.status_bar.showMessage("Text edited. Will re-synthesize on play.")
 
                 # Stop any existing progressive playback
                 if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
@@ -1183,22 +1253,72 @@ class MainWindow(QMainWindow):
 
                     # Find the corresponding time in the word timings
                     # Check if we have word_timings_list from the TTS engine
-                    if hasattr(self.tts_engine, 'word_timings_list') and self.tts_engine.word_timings_list and word_index < len(self.tts_engine.word_timings_list):
-                        # Use the list version for direct index access
-                        target_time = self.tts_engine.word_timings_list[word_index]["start"]
-                        print(f"Rewinding to time: {target_time:.2f}s (using word_timings_list)")
+                    if hasattr(self.tts_engine, 'word_timings_list') and self.tts_engine.word_timings_list:
+                        if word_index < len(self.tts_engine.word_timings_list):
+                            # Use the list version for direct index access
+                            target_time = self.tts_engine.word_timings_list[word_index]["start"]
+                            print(f"Rewinding to time: {target_time:.2f}s (using word_timings_list at index {word_index})")
+                        else:
+                            # Try to find the closest word by position
+                            print(f"Word index {word_index} out of range, trying to find closest word by position")
+                            closest_word = None
+                            closest_distance = float('inf')
+
+                            for i, timing in enumerate(self.tts_engine.word_timings_list):
+                                if "position" in timing:
+                                    distance = abs(timing["position"] - current_cursor_position)
+                                    if distance < closest_distance:
+                                        closest_distance = distance
+                                        closest_word = timing
+
+                            if closest_word:
+                                target_time = closest_word["start"]
+                                print(f"Found closest word at position {closest_word.get('position')}, time: {target_time:.2f}s")
+                            else:
+                                # If no word with position found, use the last word
+                                if self.tts_engine.word_timings_list:
+                                    target_time = self.tts_engine.word_timings_list[-1]["start"]
+                                    print(f"Using last word timing, time: {target_time:.2f}s")
+                                else:
+                                    print("No word timings available, starting from beginning")
+                                    target_time = 0.0
                     # Otherwise try to find the closest position in the dictionary
                     elif self.word_timings:
                         try:
                             # Get the position of this word in the text
                             text_up_to_cursor = self.current_text[:current_cursor_position]
+                            print(f"Looking for position close to {current_cursor_position} in word_timings with {len(self.word_timings)} entries")
 
-                            # Find the closest position in the word_timings dictionary
-                            positions = [int(pos) for pos in self.word_timings.keys()]
+                            # Get all positions as integers, ensuring they're valid
+                            try:
+                                positions = [int(float(pos)) for pos in self.word_timings.keys() if str(pos).strip()]
+                                print(f"Found {len(positions)} valid positions in word_timings")
+
+                                # Print some sample positions for debugging
+                                if positions:
+                                    sample_positions = positions[:5] if len(positions) > 5 else positions
+                                    print(f"Sample positions: {sample_positions}")
+                            except Exception as e:
+                                print(f"Error converting positions to integers: {str(e)}")
+                                positions = []
+
+                            # Find the closest position
                             if positions:
                                 closest_pos = min(positions, key=lambda x: abs(x - current_cursor_position))
-                                target_time = self.word_timings[closest_pos]
-                                print(f"Rewinding to time: {target_time:.2f}s (using closest position {closest_pos})")
+                                # Convert to string to look up in the dictionary
+                                closest_pos_key = str(closest_pos)
+                                if closest_pos_key in self.word_timings:
+                                    target_time = float(self.word_timings[closest_pos_key])
+                                    print(f"Rewinding to time: {target_time:.2f}s (using closest position {closest_pos})")
+                                else:
+                                    # Try with float key
+                                    closest_pos_key = float(closest_pos)
+                                    if closest_pos_key in self.word_timings:
+                                        target_time = float(self.word_timings[closest_pos_key])
+                                        print(f"Rewinding to time: {target_time:.2f}s (using closest position {closest_pos})")
+                                    else:
+                                        print(f"Closest position {closest_pos} not found in word_timings, starting from beginning")
+                                        target_time = 0.0
                             else:
                                 print("No positions available in word_timings, starting from beginning")
                                 target_time = 0.0
@@ -1307,37 +1427,115 @@ class MainWindow(QMainWindow):
                             # self.word_timings is now a dictionary mapping positions to times
                             print(f"Looking for closest position to cursor position {cursor_pos} in word_timings with {len(self.word_timings)} entries")
 
-                            # Get all positions as integers
-                            positions = [int(pos) for pos in self.word_timings.keys()]
+                            # Get all positions as integers, ensuring they're valid
+                            try:
+                                positions = [int(float(pos)) for pos in self.word_timings.keys() if str(pos).strip()]
+                                print(f"Found {len(positions)} valid positions in word_timings")
+
+                                # Print some sample positions for debugging
+                                if positions:
+                                    sample_positions = positions[:5] if len(positions) > 5 else positions
+                                    print(f"Sample positions: {sample_positions}")
+                            except Exception as e:
+                                print(f"Error converting positions to integers: {str(e)}")
+                                positions = []
 
                             # Find the closest position
                             if positions:
                                 closest_pos = min(positions, key=lambda x: abs(x - cursor_pos))
-                                time_ms = int(self.word_timings[closest_pos] * 1000)
-                                print(f"Setting playback position to {time_ms}ms based on cursor at position {cursor_pos} (closest position: {closest_pos})")
-                                self.media_player.setPosition(time_ms)
+                                # Convert to string to look up in the dictionary
+                                closest_pos_key = str(closest_pos)
+                                if closest_pos_key in self.word_timings:
+                                    time_ms = int(float(self.word_timings[closest_pos_key]) * 1000)
+                                    print(f"Setting playback position to {time_ms}ms based on cursor at position {cursor_pos} (closest position: {closest_pos})")
+                                    self.media_player.setPosition(time_ms)
+                                else:
+                                    # Try with float key
+                                    closest_pos_key = float(closest_pos)
+                                    if closest_pos_key in self.word_timings:
+                                        time_ms = int(float(self.word_timings[closest_pos_key]) * 1000)
+                                        print(f"Setting playback position to {time_ms}ms based on cursor at position {cursor_pos} (closest position: {closest_pos})")
+                                        self.media_player.setPosition(time_ms)
+                                    else:
+                                        print(f"Closest position {closest_pos} not found in word_timings")
+                                        # Start from the beginning
+                                        self.media_player.setPosition(0)
                             else:
-                                print("No positions available in word_timings")
+                                print("No valid positions available in word_timings")
+                                # Start from the beginning
+                                self.media_player.setPosition(0)
                         except Exception as e:
                             print(f"Error finding closest position: {str(e)}")
                             # Start from the beginning if there's an error
                             self.media_player.setPosition(0)
 
+                    # Check if the audio file exists and is valid
+                    if self.current_audio_path and os.path.exists(self.current_audio_path):
+                        file_size = os.path.getsize(self.current_audio_path)
+                        print(f"Audio file exists at {self.current_audio_path}, size: {file_size} bytes")
+
+                        if file_size == 0:
+                            print("Warning: Audio file is empty")
+                            self.status_bar.showMessage("Error: Audio file is empty")
+                            return
+
+                        # Double-check the media source
+                        current_source = self.media_player.source().toString()
+                        expected_source = QUrl.fromLocalFile(self.current_audio_path).toString()
+
+                        if current_source != expected_source:
+                            print(f"Media source mismatch. Current: {current_source}, Expected: {expected_source}")
+                            # Reset the source
+                            file_url = QUrl.fromLocalFile(self.current_audio_path)
+                            self.media_player.setSource(file_url)
+                            print(f"Reset media source to: {file_url.toString()}")
+                    else:
+                        print(f"Audio file does not exist at {self.current_audio_path}")
+                        self.status_bar.showMessage("Error: Audio file not found")
+                        return
+
                     # Use the media player for non-progressive playback
+                    print("Starting media player playback...")
                     self.media_player.play()
+
+                    # Give it a moment to start
+                    time.sleep(0.1)
 
                     # Check if playback actually started
                     if self.media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
                         print(f"Playback failed to start. Media player state: {self.media_player.playbackState()}")
                         print(f"Media player error: {self.media_player.error()}")
-                        self.status_bar.showMessage(f"Playback error: {self.media_player.errorString()}")
-                    else:
-                        # Update UI
-                        self.play_button.setIcon(self.pause_icon)
-                        self.text_display.setReadOnly(True)
-                        self.highlight_timer.start(250)  # Slower highlighting
-                        self.is_playing = True
-                        print("Playback started successfully")
+                        error_string = self.media_player.errorString()
+                        print(f"Error string: {error_string}")
+
+                        # Try to recover
+                        print("Attempting to recover by resetting media player...")
+                        self.media_player.stop()
+                        self.media_player.setSource(QUrl())  # Clear source
+                        time.sleep(0.1)
+
+                        # Set source again
+                        file_url = QUrl.fromLocalFile(self.current_audio_path)
+                        self.media_player.setSource(file_url)
+                        time.sleep(0.1)
+
+                        # Try to play again
+                        self.media_player.play()
+                        time.sleep(0.1)
+
+                        if self.media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                            print("Recovery attempt failed")
+                            self.status_bar.showMessage(f"Playback error: {error_string}")
+                            return
+                        else:
+                            print("Recovery successful")
+
+                    # Update UI
+                    self.play_button.setIcon(self.pause_icon)
+                    self.text_display.setReadOnly(True)
+                    self.highlight_timer.start(250)  # Slower highlighting
+                    self.is_playing = True
+                    print("Playback started successfully")
         except Exception as e:
             print(f"Error in _start_or_resume_playback: {str(e)}")
             self.status_bar.showMessage(f"Error resuming playback: {str(e)}")
@@ -1444,7 +1642,20 @@ class MainWindow(QMainWindow):
         if page_index != self.current_page_index:
             # Save any edits to the current page
             if not self.text_display.isReadOnly():
-                self.pages[self.current_page_index] = self.text_display.toPlainText()
+                current_page_text = self.text_display.toPlainText()
+                self.pages[self.current_page_index] = current_page_text
+
+                # Save the edited text if we have a current file path
+                if self.current_file_path:
+                    try:
+                        # Rebuild the full text
+                        self.current_text = '\n\n'.join(self.pages)
+
+                        # Save directly to the markdown file
+                        markdown_path = self.text_processor.save_markdown(self.current_text, self.current_file_path)
+                        print(f"Saved edited content to {markdown_path} when jumping to bookmark")
+                    except Exception as e:
+                        print(f"Error saving edited file when jumping to bookmark: {str(e)}")
 
             # Set the current page index
             self.current_page_index = page_index
@@ -1602,7 +1813,20 @@ class MainWindow(QMainWindow):
 
             # Save any edits to the current page
             if not self.text_display.isReadOnly():
-                self.pages[self.current_page_index] = self.text_display.toPlainText()
+                current_page_text = self.text_display.toPlainText()
+                self.pages[self.current_page_index] = current_page_text
+
+                # Save the edited text if we have a current file path
+                if self.current_file_path:
+                    try:
+                        # Rebuild the full text
+                        self.current_text = '\n\n'.join(self.pages)
+
+                        # Save directly to the markdown file
+                        markdown_path = self.text_processor.save_markdown(self.current_text, self.current_file_path)
+                        print(f"Saved edited content to {markdown_path} when changing page")
+                    except Exception as e:
+                        print(f"Error saving edited file when changing page: {str(e)}")
 
             # Go to previous page
             self.current_page_index -= 1
@@ -1650,7 +1874,20 @@ class MainWindow(QMainWindow):
 
             # Save any edits to the current page
             if not self.text_display.isReadOnly():
-                self.pages[self.current_page_index] = self.text_display.toPlainText()
+                current_page_text = self.text_display.toPlainText()
+                self.pages[self.current_page_index] = current_page_text
+
+                # Save the edited text if we have a current file path
+                if self.current_file_path:
+                    try:
+                        # Rebuild the full text
+                        self.current_text = '\n\n'.join(self.pages)
+
+                        # Save directly to the markdown file
+                        markdown_path = self.text_processor.save_markdown(self.current_text, self.current_file_path)
+                        print(f"Saved edited content to {markdown_path} when changing page")
+                    except Exception as e:
+                        print(f"Error saving edited file when changing page: {str(e)}")
 
             # Go to next page
             self.current_page_index += 1
