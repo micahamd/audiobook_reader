@@ -238,6 +238,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Acknowledgements
 
-- [Kokoro ONNX](https://github.com/thewh1teagle/kokoro-onnx) for text-to-speech
-- [OpenAI Whisper](https://github.com/openai/whisper) for speech recognition
-- [markitdown-core](https://github.com/markitdown/markitdown) for text file conversion
+- [Kokoro ONNX](https://github.com/thewh1teagle/kokoro-onnx) for text-to-speech synthesis - this project relies heavily on the Kokoro TTS model for high-quality speech generation
+- [OpenAI Whisper](https://github.com/openai/whisper) for speech recognition and transcription - Whisper provides the core speech-to-text functionality
+- [markitdown-core](https://github.com/markitdown/markitdown) for text file conversion and processing
