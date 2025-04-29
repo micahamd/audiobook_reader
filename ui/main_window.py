@@ -1048,9 +1048,6 @@ class MainWindow(QMainWindow):
             # Store the current playback position for resuming later
             self.last_playback_position = current_time
 
-            # Simplified highlighting approach - highlight the current chunk or sentence
-            # This reduces computational load and potential issues with word-level highlighting
-
             # Get the current text
             current_text = self.text_display.toPlainText()
 
@@ -1104,6 +1101,9 @@ class MainWindow(QMainWindow):
                         sentence_end = current_text.find('.', self.last_highlighted_position)
                         if sentence_end == -1:
                             sentence_end = len(current_text)
+                        else:
+                            # Include the period in the highlight
+                            sentence_end += 1
 
                         # Highlight the sentence
                         cursor = QTextCursor(self.text_display.document())
@@ -1116,6 +1116,11 @@ class MainWindow(QMainWindow):
                         scroll_cursor.setPosition(self.last_highlighted_position)
                         self.text_display.setTextCursor(scroll_cursor)
                         self.text_display.ensureCursorVisible()
+
+                        # Print debug info occasionally
+                        if current_word_index % 10 == 0:
+                            print(f"Highlighting word at index {current_word_index}, position {self.last_highlighted_position}, time {current_time:.2f}s")
+                            print(f"Sentence: '{current_text[sentence_start:sentence_end]}'")
             else:
                 # If no word timings, use a simpler approach based on playback progress
                 total_duration = self.media_player.duration() / 1000.0
@@ -1129,6 +1134,9 @@ class MainWindow(QMainWindow):
                     sentence_end = current_text.find('.', estimated_position)
                     if sentence_end == -1:
                         sentence_end = len(current_text)
+                    else:
+                        # Include the period in the highlight
+                        sentence_end += 1
 
                     # Highlight the sentence
                     cursor = QTextCursor(self.text_display.document())
@@ -1145,6 +1153,11 @@ class MainWindow(QMainWindow):
                     scroll_cursor.setPosition(estimated_position)
                     self.text_display.setTextCursor(scroll_cursor)
                     self.text_display.ensureCursorVisible()
+
+                    # Print debug info occasionally
+                    if int(current_time) % 5 == 0:
+                        print(f"Highlighting at estimated position {estimated_position}, time {current_time:.2f}s")
+                        print(f"Sentence: '{current_text[sentence_start:sentence_end]}'")
 
         except Exception as e:
             print(f"Error in update_highlight: {str(e)}")
@@ -1180,6 +1193,10 @@ class MainWindow(QMainWindow):
                 # Store the new cursor position
                 self.last_cursor_position = new_cursor_position
                 print(f"Cursor manually moved to position: {self.last_cursor_position}")
+
+                # Clear the last playback position to ensure we start from the cursor position
+                self.last_playback_position = 0
+                print("Reset last_playback_position to prioritize cursor position")
 
     def preprocess_nearby_pages(self):
         """Preprocess nearby pages in the background."""
@@ -1515,7 +1532,7 @@ class MainWindow(QMainWindow):
             cursor_pos = self.text_display.textCursor().position()
             print(f"Current cursor position: {cursor_pos}")
 
-            # Check if cursor was manually moved
+            # Always prioritize cursor position if it was manually moved
             if self.cursor_manually_moved:
                 print("Cursor was manually moved, prioritizing cursor position over saved position")
                 # Reset the last playback position to force using the cursor position
@@ -1539,12 +1556,19 @@ class MainWindow(QMainWindow):
                         self.last_playback_position = last_position / 1000.0  # Convert from ms to seconds
                         print(f"Loaded saved position from state: {self.last_playback_position}s")
 
+            # If we still don't have a position but have a cursor position, use that
+            if self.last_playback_position == 0 and cursor_pos > 0:
+                print(f"No saved playback position, using current cursor position: {cursor_pos}")
+                # We'll convert this to a time position later in the method
+
             # If we're using progressive playback
             if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
                 print("Resuming progressive playback")
 
-                # If cursor was manually moved, use the cursor position
-                if self.cursor_manually_moved or not hasattr(self, 'last_playback_position') or self.last_playback_position == 0:
+                # Determine which position to use - prioritize cursor position if available
+                use_cursor_position = (self.last_playback_position == 0 or self.cursor_manually_moved)
+
+                if use_cursor_position:
                     # Get the current cursor position
                     cursor_pos = self.text_display.textCursor().position()
                     print(f"Using cursor position for progressive playback: {cursor_pos}")
@@ -1552,20 +1576,47 @@ class MainWindow(QMainWindow):
                     # Try to find the corresponding time position if we have word timings
                     if self.word_timings:
                         try:
-                            # Convert keys to integers for comparison
-                            positions = []
-                            for pos_key in self.word_timings.keys():
-                                try:
-                                    positions.append(int(float(pos_key)))
-                                except (ValueError, TypeError):
-                                    pass
+                            # Handle different types of word_timings
+                            if isinstance(self.word_timings, dict):
+                                # Convert keys to integers for comparison
+                                positions = []
+                                for pos_key in self.word_timings.keys():
+                                    try:
+                                        positions.append(int(float(pos_key)))
+                                    except (ValueError, TypeError):
+                                        pass
 
-                            if positions:
-                                closest_pos = min(positions, key=lambda x: abs(x - cursor_pos))
-                                closest_pos_key = str(closest_pos)
+                                if positions:
+                                    closest_pos = min(positions, key=lambda x: abs(x - cursor_pos))
+                                    closest_pos_key = str(closest_pos)
 
-                                if closest_pos_key in self.word_timings:
-                                    time_sec = float(self.word_timings[closest_pos_key])
+                                    if closest_pos_key in self.word_timings:
+                                        time_sec = float(self.word_timings[closest_pos_key])
+                                        print(f"Setting playback position to {time_sec}s based on cursor at position {cursor_pos}")
+
+                                        # Set the position in the TTS engine
+                                        self.tts_engine.set_position(time_sec)
+                                        self.last_playback_position = time_sec
+
+                                        # Find the chunk containing this position
+                                        chunk_index = self.tts_engine.find_chunk_for_position(time_sec)
+                                        if chunk_index >= 0:
+                                            print(f"Resuming from chunk {chunk_index}")
+                                            self.tts_engine.rewind_to_chunk(chunk_index)
+                            elif isinstance(self.word_timings, list):
+                                # Find the closest position in the list
+                                closest_timing = None
+                                closest_distance = float('inf')
+
+                                for timing in self.word_timings:
+                                    if isinstance(timing, dict) and "position" in timing:
+                                        distance = abs(timing["position"] - cursor_pos)
+                                        if distance < closest_distance:
+                                            closest_distance = distance
+                                            closest_timing = timing
+
+                                if closest_timing and "start" in closest_timing:
+                                    time_sec = closest_timing["start"]
                                     print(f"Setting playback position to {time_sec}s based on cursor at position {cursor_pos}")
 
                                     # Set the position in the TTS engine
@@ -1659,8 +1710,10 @@ class MainWindow(QMainWindow):
                 else:
                     print("Using media player for playback")
 
-                    # If cursor was manually moved, prioritize cursor position
-                    if self.cursor_manually_moved and self.word_timings and cursor_pos > 0:
+                    # Determine which position to use - prioritize cursor position if available
+                    use_cursor_position = (self.last_playback_position == 0 or self.cursor_manually_moved)
+
+                    if use_cursor_position and self.word_timings and cursor_pos > 0:
                         print(f"Using cursor position for media playback: {cursor_pos}")
                         # Reset the flag
                         self.cursor_manually_moved = False
