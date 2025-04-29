@@ -1150,8 +1150,10 @@ class KokoroOnnxEngine:
         except Exception as e:
             warnings.warn(f"Error clearing temp directory: {str(e)}")
 
-    def unload_model(self):
-        """Unload the model to free memory and clean up resources."""
+    def stop_all_tasks(self):
+        """Stop all async tasks and clean up resources."""
+        print("Stopping all TTS engine tasks")
+
         # Stop any ongoing processes
         self.stop_requested = True
         self.pause_requested = False
@@ -1199,6 +1201,14 @@ class KokoroOnnxEngine:
         except Exception as e:
             print(f"Error handling asyncio tasks: {str(e)}")
 
-        # Finally, unload the model
-        self.kokoro = None
+    def unload_model(self):
+        """Unload the model to free memory and clean up resources."""
+        # First stop all tasks
+        self.stop_all_tasks()
+
+        # Set the model to None to free memory
+        if self.kokoro is not None:
+            print("Unloading Kokoro model")
+            self.kokoro = None
+
         print("TTS model unloaded successfully")

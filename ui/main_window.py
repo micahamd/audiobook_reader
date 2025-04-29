@@ -91,6 +91,7 @@ class MainWindow(QMainWindow):
         self.last_playback_position = 0  # Track the last playback position
         self.last_cursor_position = 0  # Track the last cursor position
         self.cursor_manually_moved = False  # Track if cursor was manually moved
+        self.last_highlighted_position = 0  # Track the last highlighted position
         self.highlight_timer = QTimer()
         self.highlight_timer.timeout.connect(self.update_highlight)
 
@@ -252,6 +253,19 @@ class MainWindow(QMainWindow):
         if window_position:
             self.move(window_position[0], window_position[1])
 
+        # Get the last page index (will be used in load_file)
+        self.last_saved_page_index = self.state_manager.get("last_page_index", 0)
+        print(f"Loaded last page index from state: {self.last_saved_page_index}")
+
+        # Get the last position (will be used in load_file)
+        last_position = self.state_manager.get("last_position", 0)
+        if last_position > 0:
+            self.last_playback_position = last_position / 1000.0  # Convert from ms to seconds
+            print(f"Loaded last position from state: {self.last_playback_position}s")
+
+        # Reset cursor_manually_moved flag on startup
+        self.cursor_manually_moved = False
+
         # Load last file if it exists
         last_file = self.state_manager.get("last_file")
         if last_file and validate_file_path(last_file):
@@ -267,26 +281,22 @@ class MainWindow(QMainWindow):
         if self.current_file_path:
             self.state_manager.set("last_file", self.current_file_path)
 
+            # Save current page index
+            self.state_manager.set("last_page_index", self.current_page_index)
+
         # Save current position
         if self.media_player.position() > 0:
             self.state_manager.set("last_position", self.media_player.position())
+        elif hasattr(self, 'last_playback_position') and self.last_playback_position > 0:
+            self.state_manager.set("last_position", self.last_playback_position * 1000)  # Convert to ms
 
         # Save state to disk
         self.state_manager.save_state()
 
     def closeEvent(self, event):
         """Handle window close event."""
-        # Save current playback position before closing
-        self._save_current_position()
-
-        # Save application state
-        self.save_state()
-
         # Set a flag to indicate we're shutting down to prevent callbacks from accessing UI
         self.is_shutting_down = True
-
-        # Reset the cursor_manually_moved flag to ensure it doesn't persist between sessions
-        self.cursor_manually_moved = False
 
         # Stop any ongoing playback
         if self.is_playing:
@@ -300,6 +310,12 @@ class MainWindow(QMainWindow):
             # Update UI state
             self.is_playing = False
             self.highlight_timer.stop()
+
+        # Save current playback position before closing
+        self._save_current_position()
+
+        # Save application state
+        self.save_state()
 
         # Wait for any existing threads to finish
         if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
@@ -323,6 +339,14 @@ class MainWindow(QMainWindow):
         # Unload the TTS model to free resources
         try:
             print("Unloading TTS model...")
+            # Make sure all async tasks are properly stopped
+            if hasattr(self.tts_engine, 'stop_all_tasks'):
+                self.tts_engine.stop_all_tasks()
+
+            # Wait a moment for tasks to clean up
+            time.sleep(0.5)
+
+            # Now unload the model
             self.tts_engine.unload_model()
         except Exception as e:
             print(f"Warning: Could not unload TTS model: {str(e)}")
@@ -351,15 +375,22 @@ class MainWindow(QMainWindow):
         # Get current page
         current_page = self.current_page_index
 
+        # Get cursor position - use the last highlighted position if available and playing
+        cursor_position = self.text_display.textCursor().position()
+        if self.is_playing and hasattr(self, 'last_highlighted_position') and self.last_highlighted_position > 0:
+            cursor_position = self.last_highlighted_position
+        elif hasattr(self, 'last_cursor_position') and self.last_cursor_position > 0:
+            cursor_position = self.last_cursor_position
+
         # Save position information
         file_positions = self.state_manager.get("file_positions", {})
         file_positions[self.current_file_path] = {
             "position": current_position,
             "page": current_page,
-            "cursor_position": self.text_display.textCursor().position()
+            "cursor_position": cursor_position
         }
         self.state_manager.set("file_positions", file_positions)
-        print(f"Saved position for {self.current_file_path}: {current_position}s, page {current_page}")
+        print(f"Saved position for {self.current_file_path}: {current_position}s, page {current_page}, cursor position: {cursor_position}")
 
     def import_audio(self):
         """Import an audio file."""
@@ -520,10 +551,27 @@ class MainWindow(QMainWindow):
 
                 # Get the saved cursor position
                 cursor_position = saved_position.get("cursor_position", 0)
+                if cursor_position > 0:
+                    self.last_cursor_position = cursor_position
+                    print(f"Restoring cursor position to {cursor_position}")
             else:
-                # No saved position, start from the beginning
-                self.current_page_index = 0
-                self.last_playback_position = 0
+                # No saved position from file_positions, check if we have a saved page index from state
+                if hasattr(self, 'last_saved_page_index') and self.last_saved_page_index is not None:
+                    # Use the saved page index from state
+                    self.current_page_index = min(self.last_saved_page_index, len(self.pages) - 1) if self.pages else 0
+                    print(f"Using saved page index from state: {self.current_page_index}")
+                else:
+                    # No saved position at all, start from the beginning
+                    self.current_page_index = 0
+
+                # Check if we have a last position saved in state
+                last_position = self.state_manager.get("last_position", 0)
+                if last_position > 0:
+                    self.last_playback_position = last_position / 1000.0  # Convert from ms to seconds
+                    print(f"Using last position from state: {self.last_playback_position}s")
+                else:
+                    self.last_playback_position = 0
+
                 cursor_position = 0
 
             # Display the current page
@@ -1033,6 +1081,9 @@ class MainWindow(QMainWindow):
                         self.last_highlighted_position = word_info["position"]
                         # Also update the last cursor position to match the current highlighted word
                         self.last_cursor_position = self.last_highlighted_position
+                        # Store the current time position
+                        if "start" in word_info:
+                            self.last_playback_position = word_info["start"]
 
                 # Get the word to highlight
                 word = current_word["word"]
@@ -1149,11 +1200,16 @@ class MainWindow(QMainWindow):
         """Handle cursor position changes in the text display."""
         # Only track cursor movements when not playing
         if not self.is_playing:
-            # Mark that the cursor was manually moved
-            self.cursor_manually_moved = True
-            # Store the new cursor position
-            self.last_cursor_position = self.text_display.textCursor().position()
-            print(f"Cursor manually moved to position: {self.last_cursor_position}")
+            # Get the new cursor position
+            new_cursor_position = self.text_display.textCursor().position()
+
+            # Only mark as manually moved if the position actually changed
+            if not hasattr(self, 'last_cursor_position') or new_cursor_position != self.last_cursor_position:
+                # Mark that the cursor was manually moved
+                self.cursor_manually_moved = True
+                # Store the new cursor position
+                self.last_cursor_position = new_cursor_position
+                print(f"Cursor manually moved to position: {self.last_cursor_position}")
 
     def preprocess_nearby_pages(self):
         """Preprocess nearby pages in the background."""
@@ -1310,8 +1366,8 @@ class MainWindow(QMainWindow):
                     self.last_cursor_position = self.last_highlighted_position
                     print(f"Using highlighted position: {self.last_highlighted_position} as cursor position")
 
-                # Reset the cursor_manually_moved flag when pausing
-                self.cursor_manually_moved = False
+                # Don't reset the cursor_manually_moved flag when pausing
+                # This allows us to remember if the cursor was manually moved before pausing
 
                 # Store the current playback position
                 if using_progressive:
@@ -1494,15 +1550,24 @@ class MainWindow(QMainWindow):
                 print("Cursor was manually moved, prioritizing cursor position over saved position")
                 # Reset the last playback position to force using the cursor position
                 self.last_playback_position = 0
-                # Reset the flag
+                # Reset the flag after using it
                 self.cursor_manually_moved = False
             # If cursor wasn't manually moved, check if we have a saved position
-            elif self.current_file_path and not hasattr(self, 'last_playback_position'):
-                file_positions = self.state_manager.get("file_positions", {})
-                saved_position = file_positions.get(self.current_file_path, {})
-                if saved_position and "position" in saved_position:
-                    self.last_playback_position = saved_position["position"]
-                    print(f"Loaded saved position from state: {self.last_playback_position}s")
+            elif not hasattr(self, 'last_playback_position') or self.last_playback_position == 0:
+                # Try to get position from file_positions
+                if self.current_file_path:
+                    file_positions = self.state_manager.get("file_positions", {})
+                    saved_position = file_positions.get(self.current_file_path, {})
+                    if saved_position and "position" in saved_position:
+                        self.last_playback_position = saved_position["position"]
+                        print(f"Loaded saved position from file_positions: {self.last_playback_position}s")
+
+                # If still no position, try from last_position in state
+                if self.last_playback_position == 0:
+                    last_position = self.state_manager.get("last_position", 0)
+                    if last_position > 0:
+                        self.last_playback_position = last_position / 1000.0  # Convert from ms to seconds
+                        print(f"Loaded saved position from state: {self.last_playback_position}s")
 
             # If we're using progressive playback
             if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
@@ -1542,8 +1607,14 @@ class MainWindow(QMainWindow):
                     print("No audio path, starting new synthesis")
                     # Start synthesis from the current cursor position or saved position
                     start_pos = cursor_pos
-                    if hasattr(self, 'last_playback_position') and self.last_playback_position > 0:
-                        # If we have a saved position, use that instead
+
+                    # If cursor was manually moved, always use the cursor position
+                    if self.cursor_manually_moved:
+                        print(f"Using cursor position for synthesis: {cursor_pos}")
+                        # Reset the flag
+                        self.cursor_manually_moved = False
+                    # Otherwise, if we have a saved position, use that instead
+                    elif hasattr(self, 'last_playback_position') and self.last_playback_position > 0:
                         print(f"Using saved position for synthesis: {self.last_playback_position}s")
                         # Find the cursor position corresponding to this time
                         if self.word_timings:
@@ -1588,8 +1659,14 @@ class MainWindow(QMainWindow):
                 else:
                     print("Using media player for playback")
 
-                    # Check if we have a saved playback position
-                    if hasattr(self, 'last_playback_position') and self.last_playback_position > 0:
+                    # If cursor was manually moved, prioritize cursor position
+                    if self.cursor_manually_moved and self.word_timings and cursor_pos > 0:
+                        print(f"Using cursor position for media playback: {cursor_pos}")
+                        # Reset the flag
+                        self.cursor_manually_moved = False
+                        # Use the cursor position code below
+                    # Otherwise, check if we have a saved playback position
+                    elif hasattr(self, 'last_playback_position') and self.last_playback_position > 0:
                         # Use the saved position
                         time_ms = int(self.last_playback_position * 1000)
                         print(f"Resuming from saved position: {self.last_playback_position}s ({time_ms}ms)")

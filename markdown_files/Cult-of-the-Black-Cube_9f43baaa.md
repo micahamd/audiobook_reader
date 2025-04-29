@@ -1,7 +1,6 @@
 The Cult of the Black Cube
 
-In his introduction to this book our author wastes  no time in pinpointing a major issue that has bugged occultism and the Western magical traditions for centuries if not millennia.When I'm asked what particular spiritual tradition I follow, I often have
-to  resist  the  urge  to  say  "Saturnine  Gnosis,"  because  the  experiences,
+In his introduction to this book our author wastes  no time in pinpointing a major issue that has bugged occultism and the Western magical traditions for centuries if not millennia.When I'm asked what particular spiritual tradition I follow, I often have to  resist  the  urge  to  say  "Saturnine  Gnosis,"  because  the  experiences,
 rituals,  and practices that I follow are ultimately connected to chthonic
 entities and their ruling Intelligence that fundamentally is not a good or
 kindly being, namely the Saturnine deity.
