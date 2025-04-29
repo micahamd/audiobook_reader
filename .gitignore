@@ -23,6 +23,7 @@ var/
 # Virtual Environment
 venv/
 ENV/
+.venv/
 
 # IDE
 .idea/
@@ -36,3 +37,13 @@ temp/*
 models/whisper/*
 models/kokoro/*
 config.json
+*.wav
+*.mp3
+*.ogg
+*.flac
+*.pdf
+*.docx
+*.epub
+*.md
+!README.md
+markdown/

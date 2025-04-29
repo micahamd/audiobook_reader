@@ -18,3 +18,4 @@ sounddevice>=0.4.6
 numpy>=1.24.0
 
 # Utilities
+tqdm>=4.65.0

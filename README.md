@@ -181,6 +181,7 @@ audiobook_reader/
 - [x] Bookmark system
 - [x] Position tracking and resuming
 - [x] Cursor position preservation
+- [x] Resume playback from cursor position
 
 ### Planned Enhancements
 - [ ] Enhanced text formatting options
@@ -225,6 +226,11 @@ audiobook_reader/
    - Adjust the page size in settings for your hardware
    - Close other memory-intensive applications
    - Consider using SSD storage for better cache performance
+
+4. **Playback Position Issues**:
+   - If playback doesn't resume from the cursor position, try clicking play/pause twice
+   - Make sure to move the cursor when the player is paused
+   - Check that word timing information is available for the current text
 
 ## License
 
