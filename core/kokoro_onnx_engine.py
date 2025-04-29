@@ -170,9 +170,14 @@ class KokoroOnnxEngine:
                     # Process the direct timing information
                     if all_timings:
                         print(f"Using direct timing information: {len(all_timings)} words")
-                        word_timings = self._process_direct_timings(all_timings, text)
-                        self.word_timings = word_timings
-                        return temp_file.name, word_timings
+                        word_timings_list = self._process_direct_timings(all_timings, text)
+
+                        # Store both the list and dictionary versions
+                        self.word_timings_list = word_timings_list
+                        self.word_timings = self._convert_word_timings_to_dict(word_timings_list)
+
+                        print(f"Converted word timings to dictionary with {len(self.word_timings)} entries")
+                        return temp_file.name, word_timings_list
                     else:
                         # If no timings, fall back to heuristic method
                         raise Exception("No timing information received from stream")
@@ -202,10 +207,14 @@ class KokoroOnnxEngine:
                 duration = len(samples) / sample_rate
 
                 # Extract word timings using heuristic method
-                word_timings = self._extract_word_timings(text.split(), duration)
-                self.word_timings = word_timings
+                word_timings_list = self._extract_word_timings(text.split(), duration)
 
-                return temp_file.name, word_timings
+                # Store both the list and dictionary versions
+                self.word_timings_list = word_timings_list
+                self.word_timings = self._convert_word_timings_to_dict(word_timings_list)
+
+                print(f"Using heuristic word timings, converted to dictionary with {len(self.word_timings)} entries")
+                return temp_file.name, word_timings_list
 
         except Exception as e:
             warnings.warn(f"Failed to synthesize speech: {str(e)}. Using fallback synthesis.")
@@ -262,7 +271,10 @@ class KokoroOnnxEngine:
         chunk_path = os.path.join(self.chunks_dir, chunk_filename)
         sf.write(chunk_path, audio, self.SAMPLE_RATE)
 
-        self.word_timings = word_timings
+        # Store both the list and dictionary versions
+        self.word_timings_list = word_timings
+        self.word_timings = self._convert_word_timings_to_dict(word_timings)
+
         self.chunk_files.append(chunk_path)
 
         return chunk_path, word_timings
@@ -358,6 +370,36 @@ class KokoroOnnxEngine:
             word_timings.append(timing_info)
 
         return word_timings
+
+    def _convert_word_timings_to_dict(self, word_timings_list: List[Dict[str, Union[str, float]]]) -> Dict[int, float]:
+        """
+        Convert a list of word timing dictionaries to a position-to-time dictionary.
+        This maintains compatibility with code that expects self.word_timings to be a dictionary.
+
+        Args:
+            word_timings_list: List of dictionaries with word timing information.
+
+        Returns:
+            Dictionary mapping position (int) to start time (float).
+        """
+        position_to_time = {}
+
+        for timing in word_timings_list:
+            # Only include timings that have position information
+            if "position" in timing:
+                position = timing["position"]
+                start_time = timing["start"]
+                position_to_time[position] = start_time
+
+        # If we don't have any positions, create a simple mapping based on index
+        if not position_to_time and word_timings_list:
+            print("Warning: No position information in word timings. Creating simple index-based mapping.")
+            for i, timing in enumerate(word_timings_list):
+                # Estimate position as 6 characters per word
+                estimated_position = i * 6
+                position_to_time[estimated_position] = timing["start"]
+
+        return position_to_time
 
     def _process_word_timings(self, words, start_time=0.0, text=None):
         """
@@ -748,8 +790,11 @@ class KokoroOnnxEngine:
                 if callback:
                     callback(i, total_chunks, chunk_path, dummy_timings)
 
-        # Store the complete word timings
-        self.word_timings = all_word_timings
+        # Store the complete word timings (both list and dictionary versions)
+        self.word_timings_list = all_word_timings
+        self.word_timings = self._convert_word_timings_to_dict(all_word_timings)
+
+        print(f"Final word timings dictionary has {len(self.word_timings)} entries")
 
         # Mark synthesis as complete
         self.synthesis_complete = True

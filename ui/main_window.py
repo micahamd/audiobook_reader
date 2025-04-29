@@ -589,7 +589,17 @@ class MainWindow(QMainWindow):
 
         # Store the audio path and word timings
         self.current_audio_path = audio_path
+
+        # Store both the list and dictionary versions of word timings
+        # The list version is used for highlighting
+        if hasattr(self.tts_engine, 'word_timings_list'):
+            print(f"Using word_timings_list from TTS engine with {len(self.tts_engine.word_timings_list)} entries")
+        else:
+            print("No word_timings_list available from TTS engine")
+
+        # The dictionary version is used for cursor position lookup
         self.word_timings = word_timings
+        print(f"Stored word_timings dictionary with {len(self.word_timings) if self.word_timings else 0} entries")
 
         # Update status
         self.status_bar.showMessage("Starting playback...")
@@ -687,7 +697,17 @@ class MainWindow(QMainWindow):
             return
 
         self.current_audio_path = audio_path
+
+        # Store both the list and dictionary versions of word timings
+        # The list version is used for highlighting
+        if hasattr(self.tts_engine, 'word_timings_list'):
+            print(f"Using word_timings_list from TTS engine with {len(self.tts_engine.word_timings_list)} entries")
+        else:
+            print("No word_timings_list available from TTS engine")
+
+        # The dictionary version is used for cursor position lookup
         self.word_timings = word_timings
+        print(f"Stored word_timings dictionary with {len(self.word_timings) if self.word_timings else 0} entries")
 
         # Load the audio into the media player
         print(f"Setting media source to: {audio_path}")
@@ -790,7 +810,23 @@ class MainWindow(QMainWindow):
     def update_highlight(self):
         """Update the text highlighting based on the current playback position."""
         try:
-            if not self.word_timings or not self.is_playing:
+            if not self.is_playing:
+                return
+
+            # Check if we have word timings
+            word_timings_list = None
+
+            # First try to get the list version from the TTS engine
+            if hasattr(self.tts_engine, 'word_timings_list') and self.tts_engine.word_timings_list:
+                word_timings_list = self.tts_engine.word_timings_list
+                print(f"Using word_timings_list from TTS engine with {len(word_timings_list)} entries")
+            # If not available, check if we have a dictionary version
+            elif self.word_timings:
+                print("No word_timings_list available, using dictionary version")
+                # We can't highlight properly with just the dictionary, so return
+                return
+            else:
+                # No word timings available
                 return
 
             # Get current time - either from media player or from TTS engine
@@ -803,7 +839,7 @@ class MainWindow(QMainWindow):
 
             # Find the current word index based on time
             current_word_index = -1
-            for i, timing in enumerate(self.word_timings):
+            for i, timing in enumerate(word_timings_list):
                 if timing["start"] <= current_time <= timing["end"]:
                     current_word_index = i
                     break
@@ -811,7 +847,7 @@ class MainWindow(QMainWindow):
             # If we didn't find an exact match, find the closest word
             if current_word_index == -1:
                 # Find the word that's about to be spoken
-                for i, timing in enumerate(self.word_timings):
+                for i, timing in enumerate(word_timings_list):
                     if timing["start"] > current_time:
                         if i > 0:
                             current_word_index = i - 1
@@ -820,12 +856,12 @@ class MainWindow(QMainWindow):
                         break
 
             # If we still don't have a word, use the last word
-            if current_word_index == -1 and self.word_timings:
-                current_word_index = len(self.word_timings) - 1
+            if current_word_index == -1 and word_timings_list:
+                current_word_index = len(word_timings_list) - 1
 
             # If we have a valid word index, highlight it
-            if current_word_index >= 0 and current_word_index < len(self.word_timings):
-                current_word = self.word_timings[current_word_index]
+            if current_word_index >= 0 and current_word_index < len(word_timings_list):
+                current_word = word_timings_list[current_word_index]
 
                 # Store the current word index to avoid unnecessary updates
                 if hasattr(self, 'last_highlighted_index') and self.last_highlighted_index == current_word_index:
@@ -834,9 +870,9 @@ class MainWindow(QMainWindow):
                 self.last_highlighted_index = current_word_index
 
                 # Store the current position in the text for resuming playback
-                if current_word_index >= 0 and current_word_index < len(self.word_timings):
+                if current_word_index >= 0 and current_word_index < len(word_timings_list):
                     # Get the character position of this word in the text
-                    word_info = self.word_timings[current_word_index]
+                    word_info = word_timings_list[current_word_index]
                     if "position" in word_info:
                         self.last_highlighted_position = word_info["position"]
                         # Also update the last cursor position to match the current highlighted word
@@ -1146,9 +1182,32 @@ class MainWindow(QMainWindow):
                     word_index = len(text_up_to_cursor.split())
 
                     # Find the corresponding time in the word timings
-                    if word_index < len(self.word_timings):
-                        target_time = self.word_timings[word_index]["start"]
-                        print(f"Rewinding to time: {target_time:.2f}s")
+                    # Check if we have word_timings_list from the TTS engine
+                    if hasattr(self.tts_engine, 'word_timings_list') and self.tts_engine.word_timings_list and word_index < len(self.tts_engine.word_timings_list):
+                        # Use the list version for direct index access
+                        target_time = self.tts_engine.word_timings_list[word_index]["start"]
+                        print(f"Rewinding to time: {target_time:.2f}s (using word_timings_list)")
+                    # Otherwise try to find the closest position in the dictionary
+                    elif self.word_timings:
+                        try:
+                            # Get the position of this word in the text
+                            text_up_to_cursor = self.current_text[:current_cursor_position]
+
+                            # Find the closest position in the word_timings dictionary
+                            positions = [int(pos) for pos in self.word_timings.keys()]
+                            if positions:
+                                closest_pos = min(positions, key=lambda x: abs(x - current_cursor_position))
+                                target_time = self.word_timings[closest_pos]
+                                print(f"Rewinding to time: {target_time:.2f}s (using closest position {closest_pos})")
+                            else:
+                                print("No positions available in word_timings, starting from beginning")
+                                target_time = 0.0
+                        except Exception as e:
+                            print(f"Error finding time for cursor position: {str(e)}")
+                            target_time = 0.0
+                    else:
+                        print("No word timings available, starting from beginning")
+                        target_time = 0.0
 
                         # For progressive playback
                         if hasattr(self, 'synthesis_thread') and self.synthesis_thread and self.synthesis_thread.is_alive():
@@ -1178,12 +1237,9 @@ class MainWindow(QMainWindow):
                             self.highlight_timer.start(250)  # Slower highlighting
                             self.is_playing = True
                             self.status_bar.showMessage(f"Rewound to position {format_time(target_time)}")
-                    else:
-                        print("Could not find word timing for rewind position")
-                        # Just start normal playback
-                        self._start_or_resume_playback()
                 else:
-                    # No word at cursor, just start normal playback
+                    print("Could not find word timing for rewind position")
+                    # Just start normal playback
                     self._start_or_resume_playback()
             else:
                 # No rewind or edit, just start or resume playback
@@ -1245,12 +1301,27 @@ class MainWindow(QMainWindow):
                         print(f"Resuming from saved position: {self.last_playback_position}s ({time_ms}ms)")
                         self.media_player.setPosition(time_ms)
                     # Otherwise, set the position based on the cursor position if possible
-                    elif self.word_timings and cursor_pos < len(self.word_timings):
-                        # Find the closest word timing to the cursor position
-                        closest_pos = min(self.word_timings.keys(), key=lambda x: abs(x - cursor_pos))
-                        time_ms = int(self.word_timings[closest_pos] * 1000)
-                        print(f"Setting playback position to {time_ms}ms based on cursor at position {cursor_pos}")
-                        self.media_player.setPosition(time_ms)
+                    elif self.word_timings and cursor_pos > 0:
+                        try:
+                            # Find the closest word timing to the cursor position
+                            # self.word_timings is now a dictionary mapping positions to times
+                            print(f"Looking for closest position to cursor position {cursor_pos} in word_timings with {len(self.word_timings)} entries")
+
+                            # Get all positions as integers
+                            positions = [int(pos) for pos in self.word_timings.keys()]
+
+                            # Find the closest position
+                            if positions:
+                                closest_pos = min(positions, key=lambda x: abs(x - cursor_pos))
+                                time_ms = int(self.word_timings[closest_pos] * 1000)
+                                print(f"Setting playback position to {time_ms}ms based on cursor at position {cursor_pos} (closest position: {closest_pos})")
+                                self.media_player.setPosition(time_ms)
+                            else:
+                                print("No positions available in word_timings")
+                        except Exception as e:
+                            print(f"Error finding closest position: {str(e)}")
+                            # Start from the beginning if there's an error
+                            self.media_player.setPosition(0)
 
                     # Use the media player for non-progressive playback
                     self.media_player.play()
