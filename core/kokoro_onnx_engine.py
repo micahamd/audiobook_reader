@@ -124,29 +124,88 @@ class KokoroOnnxEngine:
             return self._dummy_synthesize(text, speed)
 
         try:
-            # Generate speech using Kokoro
-            print(f"Synthesizing speech with voice: {voice}, speed: {speed}")
+            # Try to use create_stream to get direct timing information
+            try:
+                print(f"Synthesizing speech with voice: {voice}, speed: {speed} using streaming with direct timings")
 
-            # Create a temporary file for the audio
-            temp_file = tempfile.NamedTemporaryFile(suffix='.wav', dir=self.temp_dir, delete=False)
-            temp_file.close()
+                # Create a temporary file for the audio
+                temp_file = tempfile.NamedTemporaryFile(suffix='.wav', dir=self.temp_dir, delete=False)
+                temp_file.close()
 
-            # Generate speech
-            samples, sample_rate = self.kokoro.create(
-                text, voice=voice, speed=speed, lang="en-us"
-            )
+                # Create temporary lists to collect all samples and timings
+                all_samples = []
+                all_timings = []
 
-            # Save the audio to a file
-            sf.write(temp_file.name, samples, sample_rate)
+                # Create an event loop for async operations
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
 
-            # Calculate duration
-            duration = len(samples) / sample_rate
+                # Define the async function to process the stream
+                sample_rate_container = [self.SAMPLE_RATE]  # Use a container to store the sample rate
 
-            # Extract word timings
-            word_timings = self._extract_word_timings(text.split(), duration)
-            self.word_timings = word_timings
+                async def process_stream():
+                    stream = self.kokoro.create_stream(
+                        text, voice=voice, speed=speed, lang="en-us"
+                    )
 
-            return temp_file.name, word_timings
+                    async for samples, sr, timings in stream:
+                        all_samples.append(samples)
+                        # Store the sample rate for later use
+                        sample_rate_container[0] = sr
+                        if timings:
+                            all_timings.extend(timings)
+
+                # Run the async function
+                loop.run_until_complete(process_stream())
+                loop.close()
+
+                # Combine all samples
+                if all_samples:
+                    samples = np.concatenate(all_samples)
+                    sample_rate = sample_rate_container[0]
+
+                    # Save the audio to a file
+                    sf.write(temp_file.name, samples, sample_rate)
+
+                    # Process the direct timing information
+                    if all_timings:
+                        print(f"Using direct timing information: {len(all_timings)} words")
+                        word_timings = self._process_direct_timings(all_timings, text)
+                        self.word_timings = word_timings
+                        return temp_file.name, word_timings
+                    else:
+                        # If no timings, fall back to heuristic method
+                        raise Exception("No timing information received from stream")
+                else:
+                    # If no samples, fall back to create method
+                    raise Exception("No audio samples collected from stream")
+
+            except Exception as stream_error:
+                print(f"Error using create_stream: {str(stream_error)}. Falling back to create method.")
+
+                # Generate speech using Kokoro's create method
+                print(f"Synthesizing speech with voice: {voice}, speed: {speed} using create method")
+
+                # Create a temporary file for the audio
+                temp_file = tempfile.NamedTemporaryFile(suffix='.wav', dir=self.temp_dir, delete=False)
+                temp_file.close()
+
+                # Generate speech
+                samples, sample_rate = self.kokoro.create(
+                    text, voice=voice, speed=speed, lang="en-us"
+                )
+
+                # Save the audio to a file
+                sf.write(temp_file.name, samples, sample_rate)
+
+                # Calculate duration
+                duration = len(samples) / sample_rate
+
+                # Extract word timings using heuristic method
+                word_timings = self._extract_word_timings(text.split(), duration)
+                self.word_timings = word_timings
+
+                return temp_file.name, word_timings
 
         except Exception as e:
             warnings.warn(f"Failed to synthesize speech: {str(e)}. Using fallback synthesis.")
@@ -211,6 +270,7 @@ class KokoroOnnxEngine:
     def _extract_word_timings(self, words: List[str], duration: float) -> List[Dict[str, Union[str, float]]]:
         """
         Extract word timings based on words and duration.
+        This is a fallback method when direct timing information is not available.
 
         Args:
             words: List of words.
@@ -253,6 +313,51 @@ class KokoroOnnxEngine:
                 timing["end"] *= scale_factor
 
         return timings
+
+    def _process_direct_timings(self, kokoro_timings: List[Dict], text: str = None) -> List[Dict[str, Union[str, float]]]:
+        """
+        Process direct timing information from Kokoro's create_stream method.
+
+        Args:
+            kokoro_timings: List of timing dictionaries from Kokoro.
+            text: The original text for position tracking.
+
+        Returns:
+            List of dictionaries with word timing information in our format.
+        """
+        word_timings = []
+
+        # If we have the original text, try to find word positions
+        word_positions = {}
+        if text:
+            # Simple approach to find word positions in the text
+            current_pos = 0
+            for word in text.split():
+                # Find the word in the text starting from current_pos
+                word_pos = text.find(word, current_pos)
+                if word_pos >= 0:
+                    word_positions[word] = word_pos
+                    current_pos = word_pos + len(word)
+
+        for timing in kokoro_timings:
+            # Kokoro timings have 'word', 'start', and 'end' keys
+            word = timing.get("word", "")
+            start = timing.get("start", 0.0)
+            end = timing.get("end", 0.0)
+
+            timing_info = {
+                "word": word,
+                "start": start,
+                "end": end
+            }
+
+            # Add position information if available
+            if word in word_positions:
+                timing_info["position"] = word_positions[word]
+
+            word_timings.append(timing_info)
+
+        return word_timings
 
     def _process_word_timings(self, words, start_time=0.0, text=None):
         """
@@ -375,7 +480,13 @@ class KokoroOnnxEngine:
         stream = self.kokoro.create_stream(
             text, voice=voice, speed=speed, lang="en-us"
         )
-        async for samples, sr in stream:
+
+        # The stream now yields (samples, sr, timings) tuples
+        async for samples, sr, timings in stream:
+            # Print timing information for debugging
+            if timings:
+                print(f"Received timing information: {len(timings)} words")
+
             while self.pause_requested:
                 await asyncio.sleep(0.1)
             if self.stop_requested:
@@ -516,20 +627,75 @@ class KokoroOnnxEngine:
                 chunk_path = os.path.join(self.chunks_dir, chunk_filename)
                 self.chunk_files.append(chunk_path)
 
-                # Generate speech
-                samples, sample_rate = self.kokoro.create(
-                    chunk, voice=voice, speed=speed, lang="en-us"
-                )
+                # Try to use create_stream to get direct timing information
+                try:
+                    # Create a temporary list to collect all samples and timings
+                    all_samples = []
+                    all_timings = []
 
-                # Save the audio to a file
-                sf.write(chunk_path, samples, sample_rate)
+                    # Create an event loop for async operations
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
 
-                # Calculate duration
-                duration = len(samples) / sample_rate
+                    # Define the async function to process the stream
+                    sample_rate_container = [self.SAMPLE_RATE]  # Use a container to store the sample rate
 
-                # Extract word timings
-                chunk_words = chunk.split()
-                word_timings = self._extract_word_timings(chunk_words, duration)
+                    async def process_stream():
+                        stream = self.kokoro.create_stream(
+                            chunk, voice=voice, speed=speed, lang="en-us"
+                        )
+
+                        async for samples, sr, timings in stream:
+                            all_samples.append(samples)
+                            # Store the sample rate for later use
+                            sample_rate_container[0] = sr
+                            if timings:
+                                all_timings.extend(timings)
+
+                    # Run the async function
+                    loop.run_until_complete(process_stream())
+                    loop.close()
+
+                    # Combine all samples
+                    if all_samples:
+                        samples = np.concatenate(all_samples)
+                        sample_rate = sample_rate_container[0]  # Get the sample rate from the container
+
+                        # Save the audio to a file
+                        sf.write(chunk_path, samples, sample_rate)
+
+                        # Calculate duration
+                        duration = len(samples) / sample_rate
+
+                        # Process the direct timing information
+                        if all_timings:
+                            print(f"Using direct timing information for chunk {i+1}: {len(all_timings)} words")
+                            word_timings = self._process_direct_timings(all_timings, chunk)
+                        else:
+                            # Fallback to heuristic timing if no direct timings
+                            print(f"No direct timing information for chunk {i+1}, using heuristic")
+                            chunk_words = chunk.split()
+                            word_timings = self._extract_word_timings(chunk_words, duration)
+                    else:
+                        # If no samples were collected, fall back to create method
+                        raise Exception("No audio samples collected from stream")
+
+                except Exception as stream_error:
+                    print(f"Error using create_stream: {str(stream_error)}. Falling back to create method.")
+                    # Fallback to the create method
+                    samples, sample_rate = self.kokoro.create(
+                        chunk, voice=voice, speed=speed, lang="en-us"
+                    )
+
+                    # Save the audio to a file
+                    sf.write(chunk_path, samples, sample_rate)
+
+                    # Calculate duration
+                    duration = len(samples) / sample_rate
+
+                    # Extract word timings using heuristic method
+                    chunk_words = chunk.split()
+                    word_timings = self._extract_word_timings(chunk_words, duration)
 
                 # Adjust timings based on offset
                 for timing in word_timings:
@@ -543,6 +709,7 @@ class KokoroOnnxEngine:
                 all_word_timings.extend(word_timings)
 
                 # Update the time offset
+                duration = word_timings[-1]["end"] - time_offset if word_timings else 0
                 time_offset += duration
 
                 # Call the callback if provided
