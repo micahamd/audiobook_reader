@@ -79,7 +79,7 @@ audiobook_reader/
 
 1. Clone the repository:
    ```
-   git clone https://github.com/yourusername/audiobook_reader.git
+   git clone https://github.com/micahamd//audiobook_reader.git
    cd audiobook_reader
    ```
 
