@@ -7,6 +7,7 @@ All files are automatically converted to markdown and stored in a dedicated dire
 import os
 import hashlib
 import time
+import fnmatch
 from pathlib import Path
 from typing import Optional, Tuple, Dict
 
@@ -37,6 +38,36 @@ class TextProcessor:
         # Cache of file paths to markdown paths
         self.file_path_cache: Dict[str, str] = {}
 
+    def find_existing_markdown(self, file_path: str) -> Optional[str]:
+        """
+        Find an existing markdown file for the given original file.
+
+        Args:
+            file_path: Path to the original file.
+
+        Returns:
+            Path to the existing markdown file, or None if not found.
+        """
+        # Get the base name of the file
+        original_filename = os.path.basename(file_path)
+        base_name, _ = os.path.splitext(original_filename)
+
+        # Look for files matching the pattern in the markdown directory
+        pattern = f"{base_name}_*.md"
+        matching_files = []
+
+        for filename in os.listdir(self.markdown_dir):
+            if fnmatch.fnmatch(filename, pattern):
+                matching_files.append(os.path.join(self.markdown_dir, filename))
+
+        if matching_files:
+            # If we found matching files, use the most recently modified one
+            most_recent = max(matching_files, key=os.path.getmtime)
+            print(f"Found existing markdown file: {most_recent}")
+            return most_recent
+
+        return None
+
     def load_file(self, file_path: str) -> Tuple[str, str]:
         """
         Load a file and convert it to Markdown if necessary.
@@ -54,19 +85,23 @@ class TextProcessor:
         file_path = Path(file_path)
         file_format = file_path.suffix.lower().lstrip('.')
 
-        # Check if we already have a markdown version of this file
-        markdown_path = self.get_markdown_path(str(file_path))
-
-        # If the markdown file exists, load it
-        if os.path.exists(markdown_path):
+        # First, try to find an existing markdown file
+        existing_markdown = self.find_existing_markdown(str(file_path))
+        if existing_markdown:
             try:
-                with open(markdown_path, 'r', encoding='utf-8') as f:
+                with open(existing_markdown, 'r', encoding='utf-8') as f:
                     content = f.read()
-                print(f"Loaded existing markdown file: {markdown_path}")
+                print(f"Loaded existing markdown file: {existing_markdown}")
+
+                # Update the cache to use this file
+                self.file_path_cache[str(file_path)] = existing_markdown
+
                 return content, 'md'
             except Exception as e:
                 print(f"Error loading existing markdown file: {e}")
                 # If there's an error, continue to create a new one
+
+        # If no existing file was found or there was an error, we'll create a new markdown file
 
         # If it's already a markdown file, just read it and save a copy
         if file_format in ['md', 'markdown']:
@@ -109,8 +144,9 @@ class TextProcessor:
         original_filename = os.path.basename(original_path)
         base_name, _ = os.path.splitext(original_filename)
 
-        # Create a unique filename to avoid collisions
-        file_hash = hashlib.md5(original_path.encode()).hexdigest()[:8]
+        # Create a unique filename based on the filename only
+        # Use just the filename for the hash to ensure consistency across sessions
+        file_hash = hashlib.md5(original_filename.lower().encode()).hexdigest()[:8]
         markdown_filename = f"{base_name}_{file_hash}.md"
         markdown_path = os.path.join(self.markdown_dir, markdown_filename)
 
